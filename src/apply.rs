@@ -1,0 +1,623 @@
+// Apply pipeline orchestration.
+
+use crate::backends::pacman::{
+    write_package_operations_log, PackageBackend, PackageExecutor, RecordingPackageExecutor,
+};
+use crate::config::BasaltConfig;
+use crate::planning::action::{plan_actions, Action};
+use crate::state::db::{index_run, StateDbArtifacts};
+use crate::state::store::{write_run_record, CurrentState, RunRecord, StateLock};
+use crate::system::services::{
+    write_service_operations_log, HostServiceExecutor, RecordingServiceExecutor, ServiceExecutor,
+};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs as unix_fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+pub struct ApplySummary {
+    pub actions: Vec<Action>,
+    pub written_files: Vec<PathBuf>,
+    pub package_operations_path: Option<PathBuf>,
+    pub service_operations_path: Option<PathBuf>,
+    pub backup_dir: PathBuf,
+    pub run_path: PathBuf,
+    pub latest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceExecutorMode {
+    Record,
+    Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageExecutorMode {
+    Record,
+}
+
+impl PackageExecutorMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "record" => Ok(Self::Record),
+            other => Err(format!(
+                "unknown package executor `{other}`; expected `record`"
+            )),
+        }
+    }
+}
+
+impl ServiceExecutorMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "record" => Ok(Self::Record),
+            "host" => Ok(Self::Host),
+            other => Err(format!(
+                "unknown service executor `{other}`; expected `record` or `host`"
+            )),
+        }
+    }
+}
+
+pub fn dry_run_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Action> {
+    plan_actions(config, current)
+}
+
+pub fn write_dry_run_record(
+    state_dir: &Path,
+    config_dir: PathBuf,
+    actions: Vec<Action>,
+    current: &CurrentState,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let record = RunRecord::dry_run(config_dir, actions, current);
+    let (run_path, latest_path) = write_run_record(state_dir, &record)?;
+    index_run(
+        state_dir,
+        &record,
+        &StateDbArtifacts {
+            run_json_path: run_path.clone(),
+            latest_json_path: latest_path.clone(),
+            ..StateDbArtifacts::default()
+        },
+    )?;
+    Ok((run_path, latest_path))
+}
+
+pub fn acquire_apply_lock(state_dir: &Path, mode: &str) -> Result<StateLock, String> {
+    StateLock::acquire(state_dir, mode)
+}
+
+pub fn apply_supported_config(
+    state_dir: &Path,
+    config_dir: PathBuf,
+    root_dir: &Path,
+    config: &BasaltConfig,
+    current: &CurrentState,
+    package_executor: PackageExecutorMode,
+    service_executor: ServiceExecutorMode,
+) -> Result<ApplySummary, String> {
+    if service_executor == ServiceExecutorMode::Host && root_dir != Path::new("/") {
+        return Err("`--service-executor host` requires `--root /`".to_string());
+    }
+
+    let actions = plan_actions(config, current);
+    let unsupported: Vec<&Action> = actions
+        .iter()
+        .filter(|action| {
+            !matches!(
+                action.domain.as_str(),
+                "system" | "files" | "services" | "packages"
+            )
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        let mut message = String::from("real apply has no executor for these actions yet:");
+        for action in unsupported {
+            message.push_str("\n- ");
+            message.push_str(&action.id);
+        }
+        message.push_str("\nRun `basalt apply --dry-run` for the full plan.");
+        return Err(message);
+    }
+
+    let lock = acquire_apply_lock(state_dir, "apply")?;
+    let backup_dir = state_dir
+        .join("backups")
+        .join(format!("apply-{}", millis_since_epoch()));
+    fs::create_dir_all(&backup_dir).map_err(|err| format!("{}: {err}", backup_dir.display()))?;
+
+    let mut written_files = Vec::new();
+    if let Some(system) = &config.system {
+        if has_action(&actions, "system.hostname") {
+            write_with_backup(
+                root_dir,
+                &backup_dir,
+                "etc/hostname",
+                format!("{}\n", system.hostname).as_bytes(),
+                &mut written_files,
+            )?;
+        }
+
+        if has_action(&actions, "system.locale") {
+            let locale = system
+                .locale
+                .as_ref()
+                .expect("system.locale action requires locale config");
+            write_with_backup(
+                root_dir,
+                &backup_dir,
+                "etc/locale.conf",
+                format!("LANG={locale}\n").as_bytes(),
+                &mut written_files,
+            )?;
+        }
+
+        if has_action(&actions, "system.keymap") {
+            let keymap = system
+                .keymap
+                .as_ref()
+                .expect("system.keymap action requires keymap config");
+            write_with_backup(
+                root_dir,
+                &backup_dir,
+                "etc/vconsole.conf",
+                format!("KEYMAP={keymap}\n").as_bytes(),
+                &mut written_files,
+            )?;
+        }
+
+        if has_action(&actions, "system.timezone") {
+            let timezone = system
+                .timezone
+                .as_ref()
+                .expect("system.timezone action requires timezone config");
+            set_timezone(root_dir, &backup_dir, timezone, &mut written_files)?;
+        }
+    }
+
+    if let Some(files) = &config.files {
+        for file in &files.managed {
+            let relative_path = managed_file_relative_path(&file.path)?;
+            write_with_backup(
+                root_dir,
+                &backup_dir,
+                &relative_path,
+                file.content.as_bytes(),
+                &mut written_files,
+            )?;
+            if let Some(mode) = &file.mode {
+                set_mode(root_dir, &relative_path, mode)?;
+            }
+        }
+    }
+
+    let package_operations_path = apply_package_operations(state_dir, &actions, package_executor)?;
+    let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
+
+    let record = RunRecord::apply(config_dir, actions.clone(), current);
+    let (run_path, latest_path) = write_run_record(state_dir, &record)?;
+    index_run(
+        state_dir,
+        &record,
+        &StateDbArtifacts {
+            run_json_path: run_path.clone(),
+            latest_json_path: latest_path.clone(),
+            package_operations_path: package_operations_path.clone(),
+            service_operations_path: service_operations_path.clone(),
+            backup_dir: Some(backup_dir.clone()),
+        },
+    )?;
+    let _ = lock.path();
+    drop(lock);
+
+    Ok(ApplySummary {
+        actions,
+        written_files,
+        package_operations_path,
+        service_operations_path,
+        backup_dir,
+        run_path,
+        latest_path,
+    })
+}
+
+fn apply_package_operations(
+    state_dir: &Path,
+    actions: &[Action],
+    mode: PackageExecutorMode,
+) -> Result<Option<PathBuf>, String> {
+    let mut executor = RecordingPackageExecutor::default();
+    for action in actions {
+        if let Some(package) = action.id.strip_prefix("packages.pacman.") {
+            executor.ensure_installed(PackageBackend::Pacman, package)?;
+        } else if let Some(package) = action.id.strip_prefix("packages.aur.") {
+            executor.ensure_installed(PackageBackend::Aur, package)?;
+        } else if let Some(package) = action.id.strip_prefix("packages.nix.") {
+            executor.ensure_installed(PackageBackend::Nix, package)?;
+        }
+    }
+
+    match mode {
+        PackageExecutorMode::Record => {}
+    }
+
+    write_package_operations_log(state_dir, executor.operations())
+}
+
+fn write_with_backup(
+    root_dir: &Path,
+    backup_dir: &Path,
+    relative_path: &str,
+    contents: &[u8],
+    written_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let target = root_dir.join(relative_path);
+    backup_existing(&target, backup_dir, relative_path)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    fs::write(&target, contents).map_err(|err| format!("{}: {err}", target.display()))?;
+    written_files.push(target);
+    Ok(())
+}
+
+fn has_action(actions: &[Action], id: &str) -> bool {
+    actions.iter().any(|action| action.id == id)
+}
+
+fn set_timezone(
+    root_dir: &Path,
+    backup_dir: &Path,
+    timezone: &str,
+    written_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let zoneinfo = root_dir.join("usr/share/zoneinfo").join(timezone);
+    if !zoneinfo.exists() {
+        return Err(format!(
+            "{}: timezone `{timezone}` is not available in target root",
+            zoneinfo.display()
+        ));
+    }
+
+    let target = root_dir.join("etc/localtime");
+    backup_existing(&target, backup_dir, "etc/localtime")?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    if target.exists() || target.is_symlink() {
+        fs::remove_file(&target).map_err(|err| format!("{}: {err}", target.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        unix_fs::symlink(format!("/usr/share/zoneinfo/{timezone}"), &target)
+            .map_err(|err| format!("{}: {err}", target.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::copy(&zoneinfo, &target).map_err(|err| format!("{}: {err}", target.display()))?;
+    }
+
+    written_files.push(target);
+    Ok(())
+}
+
+fn backup_existing(target: &Path, backup_dir: &Path, relative_path: &str) -> Result<(), String> {
+    if !target.exists() && !target.is_symlink() {
+        return Ok(());
+    }
+
+    let backup_path = backup_dir.join(relative_path.replace('/', "__"));
+    if target.is_symlink() {
+        let link = fs::read_link(target).map_err(|err| format!("{}: {err}", target.display()))?;
+        fs::write(&backup_path, link.display().to_string())
+            .map_err(|err| format!("{}: {err}", backup_path.display()))?;
+    } else {
+        fs::copy(target, &backup_path).map_err(|err| {
+            format!(
+                "failed to back up {} to {}: {err}",
+                target.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn managed_file_relative_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("managed file path cannot be empty".to_string());
+    }
+    let relative = path.trim_start_matches('/');
+    let candidate = Path::new(relative);
+    if candidate
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "managed file path `{path}` must stay inside the target root"
+        ));
+    }
+    Ok(relative.to_string())
+}
+
+fn set_mode(root_dir: &Path, relative_path: &str, mode: &str) -> Result<(), String> {
+    let target = root_dir.join(relative_path);
+    #[cfg(unix)]
+    {
+        let parsed = u32::from_str_radix(mode, 8)
+            .map_err(|err| format!("invalid mode `{mode}` for {}: {err}", target.display()))?;
+        let permissions = fs::Permissions::from_mode(parsed);
+        fs::set_permissions(&target, permissions)
+            .map_err(|err| format!("{}: {err}", target.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, mode);
+    }
+    Ok(())
+}
+
+fn apply_service_operations(
+    state_dir: &Path,
+    actions: &[Action],
+    mode: ServiceExecutorMode,
+) -> Result<Option<PathBuf>, String> {
+    let mut operations = RecordingServiceExecutor::default();
+    for action in actions {
+        if let Some(service) = action.id.strip_prefix("services.enable.") {
+            operations.enable(service)?;
+        } else if let Some(service) = action.id.strip_prefix("services.disable.") {
+            operations.disable(service)?;
+        }
+    }
+
+    let path = write_service_operations_log(state_dir, operations.operations())?;
+    if operations.operations().is_empty() {
+        return Ok(path);
+    }
+
+    match mode {
+        ServiceExecutorMode::Record => {}
+        ServiceExecutorMode::Host => {
+            let mut executor = HostServiceExecutor;
+            executor.prepare()?;
+            for operation in operations.operations() {
+                match operation.action {
+                    crate::system::services::ServiceAction::Enable => {
+                        executor.enable(&operation.service)?
+                    }
+                    crate::system::services::ServiceAction::Disable => {
+                        executor.disable(&operation.service)?
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(path)
+}
+
+fn millis_since_epoch() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::validate_config_dir;
+
+    #[test]
+    fn applies_system_identity_to_target_root() {
+        let base = std::env::temp_dir().join(format!("basalt-apply-test-{}", millis_since_epoch()));
+        let root = base.join("root");
+        let state = base.join("state");
+        fs::create_dir_all(root.join("usr/share/zoneinfo")).unwrap();
+        fs::write(root.join("usr/share/zoneinfo/UTC"), "UTC").unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/hostname"), "old-host\n").unwrap();
+
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("basalt-configs/fixtures/valid-system-apply");
+        let config = validate_config_dir(&config_dir).unwrap();
+        let summary = apply_supported_config(
+            &state,
+            config_dir,
+            &root,
+            &config,
+            &CurrentState::default(),
+            PackageExecutorMode::Record,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("etc/hostname")).unwrap(),
+            "basalt-vm\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/locale.conf")).unwrap(),
+            "LANG=en_US.UTF-8\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/vconsole.conf")).unwrap(),
+            "KEYMAP=us\n"
+        );
+        assert!(root.join("etc/localtime").exists() || root.join("etc/localtime").is_symlink());
+        assert!(summary.backup_dir.join("etc__hostname").exists());
+        assert!(summary.run_path.exists());
+        assert!(summary.latest_path.exists());
+        assert!(!state.join("basalt.lock").exists());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn records_package_actions_from_config() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-package-config-test-{}",
+            millis_since_epoch()
+        ));
+        let root = base.join("root");
+        let state = base.join("state");
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("basalt-configs/fixtures/valid-package-recording");
+        let config = validate_config_dir(&config_dir).unwrap();
+        let summary = apply_supported_config(
+            &state,
+            config_dir,
+            &root,
+            &config,
+            &CurrentState::default(),
+            PackageExecutorMode::Record,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap();
+
+        let package_log =
+            fs::read_to_string(summary.package_operations_path.expect("package log")).unwrap();
+        assert!(package_log.contains("pacman ensure-installed basalt-test-package"));
+        assert!(package_log.contains("aur ensure-installed basalt-test-aur"));
+        assert!(package_log.contains("nix ensure-installed hello"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn applies_managed_files_to_target_root() {
+        let base = std::env::temp_dir().join(format!("basalt-files-test-{}", millis_since_epoch()));
+        let root = base.join("root");
+        let state = base.join("state");
+        fs::create_dir_all(root.join("usr/share/zoneinfo")).unwrap();
+        fs::write(root.join("usr/share/zoneinfo/UTC"), "UTC").unwrap();
+        fs::create_dir_all(root.join("etc/basalt")).unwrap();
+        fs::write(root.join("etc/basalt/motd"), "old\n").unwrap();
+
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("basalt-configs/fixtures/valid-managed-files");
+        let config = validate_config_dir(&config_dir).unwrap();
+        let summary = apply_supported_config(
+            &state,
+            config_dir,
+            &root,
+            &config,
+            &CurrentState::default(),
+            PackageExecutorMode::Record,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("etc/basalt/motd")).unwrap(),
+            "Basalt managed file\n"
+        );
+        assert!(summary.backup_dir.join("etc__basalt__motd").exists());
+        assert!(summary
+            .actions
+            .iter()
+            .any(|action| action.id == "files.managed.etc/basalt/motd"));
+        assert!(summary.service_operations_path.is_some());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn rejects_managed_file_path_traversal() {
+        let err = managed_file_relative_path("../etc/passwd").unwrap_err();
+        assert!(err.contains("target root"));
+    }
+
+    #[test]
+    fn records_service_operations_without_running_systemctl() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-service-apply-test-{}",
+            millis_since_epoch()
+        ));
+        let state = base.join("state");
+        let actions = vec![
+            Action {
+                id: "services.enable.basalt-example".to_string(),
+                domain: "services".to_string(),
+                description: "enable service `basalt-example`".to_string(),
+                risk: crate::planning::action::Risk::Medium,
+            },
+            Action {
+                id: "services.disable.old-example".to_string(),
+                domain: "services".to_string(),
+                description: "disable service `old-example`".to_string(),
+                risk: crate::planning::action::Risk::High,
+            },
+        ];
+
+        let path = apply_service_operations(&state, &actions, ServiceExecutorMode::Record)
+            .unwrap()
+            .unwrap();
+        let log = fs::read_to_string(path).unwrap();
+        assert!(log.contains("enable basalt-example"));
+        assert!(log.contains("disable old-example"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn host_service_executor_requires_real_root() {
+        let err = apply_supported_config(
+            Path::new("/tmp/basalt-unused-state"),
+            PathBuf::from("config"),
+            Path::new("/tmp/basalt-root"),
+            &BasaltConfig::default(),
+            &CurrentState::default(),
+            PackageExecutorMode::Record,
+            ServiceExecutorMode::Host,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("requires `--root /`"));
+    }
+
+    #[test]
+    fn records_package_operations_without_running_pacman() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-package-apply-test-{}",
+            millis_since_epoch()
+        ));
+        let state = base.join("state");
+        let actions = vec![
+            Action {
+                id: "packages.pacman.basalt-test".to_string(),
+                domain: "packages".to_string(),
+                description: "ensure pacman package `basalt-test` is installed".to_string(),
+                risk: crate::planning::action::Risk::High,
+            },
+            Action {
+                id: "packages.aur.example-aur".to_string(),
+                domain: "packages".to_string(),
+                description: "ensure AUR package `example-aur` is installed".to_string(),
+                risk: crate::planning::action::Risk::Medium,
+            },
+        ];
+
+        let path = apply_package_operations(&state, &actions, PackageExecutorMode::Record)
+            .unwrap()
+            .unwrap();
+        let log = fs::read_to_string(path).unwrap();
+        assert!(log.contains("pacman ensure-installed basalt-test"));
+        assert!(log.contains("aur ensure-installed example-aur"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+}

@@ -1,0 +1,94 @@
+{
+  "schema_version": "0",
+  "domains": [
+    {
+      "name": "system",
+      "ownership": "owns host identity intent",
+      "fields": [
+        {
+          "path": "system.hostname",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "system.timezone",
+          "type": "string",
+          "required": false
+        },
+        {
+          "path": "system.locale",
+          "type": "string",
+          "required": false
+        },
+        {
+          "path": "system.keymap",
+          "type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "packages",
+      "ownership": "owns package desired state intent",
+      "fields": [
+        {
+          "path": "packages.pacman",
+          "type": "list<string>",
+          "required": false
+        },
+        {
+          "path": "packages.aur",
+          "type": "list<string>",
+          "required": false
+        },
+        {
+          "path": "packages.nix",
+          "type": "list<string>",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "services",
+      "ownership": "owns service desired state intent",
+      "fields": [
+        {
+          "path": "services.enable",
+          "type": "list<string>",
+          "required": false
+        },
+        {
+          "path": "services.disable",
+          "type": "list<string>",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "files",
+      "ownership": "owns managed file desired state intent",
+      "fields": [
+        {
+          "path": "files.managed",
+          "type": "list<table>",
+          "required": false
+        },
+        {
+          "path": "files.managed[].path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "files.managed[].content",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "files.managed[].mode",
+          "type": "string",
+          "required": false
+        }
+      ]
+    }
+  ]
+}

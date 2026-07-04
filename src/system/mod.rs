@@ -1,0 +1,16 @@
+pub mod aliases;
+pub mod boot;
+pub mod branding;
+pub mod configs;
+pub mod dracut;
+pub mod drivers;
+pub mod interventions;
+pub mod kernel;
+pub mod locale;
+pub mod mounts;
+pub mod network;
+pub mod nix_system;
+pub mod repos;
+pub mod services;
+pub mod stow;
+pub mod users;
