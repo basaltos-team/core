@@ -56,17 +56,18 @@ pub fn read_installed_package_snapshot() -> PackageSnapshot {
 pub fn resolve_pacman_install_transaction(
     packages: &[String],
 ) -> Result<PackageTransaction, String> {
-    let packages: Vec<&str> = packages
+    let requested: BTreeSet<String> = packages
         .iter()
-        .map(String::as_str)
-        .filter(|package| !package.trim().is_empty())
+        .map(|package| package.trim())
+        .filter(|package| !package.is_empty())
+        .map(ToOwned::to_owned)
         .collect();
-    if packages.is_empty() {
+    if requested.is_empty() {
         return Ok(PackageTransaction::default());
     }
 
     let mut args = vec!["-Sp", "--needed", "--print-format", "%n\t%v"];
-    args.extend(packages);
+    args.extend(requested.iter().map(String::as_str));
 
     let output = match run_capture("pacman", &args) {
         Ok(output) => output,
@@ -77,7 +78,7 @@ pub fn resolve_pacman_install_transaction(
     }
 
     Ok(PackageTransaction {
-        rows: parse_pacman_print_format(&output.stdout),
+        rows: parse_pacman_print_format(&output.stdout, &requested),
     })
 }
 
@@ -278,7 +279,10 @@ pub fn write_package_operations_log(
     Ok(Some(path))
 }
 
-fn parse_pacman_print_format(stdout: &str) -> Vec<PackageTransactionRow> {
+fn parse_pacman_print_format(
+    stdout: &str,
+    requested: &BTreeSet<String>,
+) -> Vec<PackageTransactionRow> {
     let mut rows = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
@@ -294,11 +298,16 @@ fn parse_pacman_print_format(stdout: &str) -> Vec<PackageTransactionRow> {
             .next()
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let reason = if requested.contains(name) {
+            PackageReason::Explicit
+        } else {
+            PackageReason::Dependency
+        };
         rows.push(PackageTransactionRow {
             package: name.to_string(),
             version,
             change: PackageTransactionChange::Install,
-            reason: PackageReason::Unknown,
+            reason,
         });
     }
     rows
@@ -355,11 +364,16 @@ mod tests {
 
     #[test]
     fn parses_pacman_print_format_transaction_rows() {
-        let rows = parse_pacman_print_format("git\t2.50.0-1\nperl-error\t0.17030-1\n");
+        let rows = parse_pacman_print_format(
+            "git\t2.50.0-1\nperl-error\t0.17030-1\n",
+            &BTreeSet::from(["git".to_string()]),
+        );
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].package, "git");
         assert_eq!(rows[0].version.as_deref(), Some("2.50.0-1"));
         assert_eq!(rows[0].change, PackageTransactionChange::Install);
+        assert_eq!(rows[0].reason, PackageReason::Explicit);
+        assert_eq!(rows[1].reason, PackageReason::Dependency);
     }
 }

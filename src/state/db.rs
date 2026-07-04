@@ -767,7 +767,7 @@ mod tests {
                     package: "basalt-test".to_string(),
                     version: Some("1.0-1".to_string()),
                     change: PackageTransactionChange::Install,
-                    reason: PackageReason::Unknown,
+                    reason: PackageReason::Explicit,
                 }],
             }),
         };
@@ -789,7 +789,7 @@ mod tests {
         );
         assert_eq!(
             inspection.resolved_package_transactions,
-            vec!["pacman install basalt-test 1.0-1 [unknown]"]
+            vec!["pacman install basalt-test 1.0-1 [explicit]"]
         );
         assert_eq!(
             inspection.requested_package_operations,
