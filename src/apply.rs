@@ -1,5 +1,7 @@
 // Apply pipeline orchestration.
 
+use crate::backends::aur::resolve_aur_install_transaction;
+use crate::backends::nix::resolve_nix_install_transaction;
 use crate::backends::pacman::{
     resolve_pacman_install_transaction, write_package_operations_log, PackageBackend,
     PackageExecutor, PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
@@ -75,7 +77,7 @@ pub fn write_dry_run_record(
     current: &CurrentState,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let record = RunRecord::dry_run(config_dir, actions, current);
-    let pacman_transaction = resolve_pacman_transaction_for_actions(&record.actions)?;
+    let transactions = resolve_package_transactions_for_actions(&record.actions)?;
     let (run_path, latest_path) = write_run_record(state_dir, &record)?;
     index_run(
         state_dir,
@@ -89,7 +91,9 @@ pub fn write_dry_run_record(
             pacman_snapshot_after: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
-            pacman_transaction: Some(pacman_transaction),
+            pacman_transaction: Some(transactions.pacman),
+            aur_transaction: Some(transactions.aur),
+            nix_transaction: Some(transactions.nix),
             ..StateDbArtifacts::default()
         },
     )?;
@@ -205,7 +209,7 @@ pub fn apply_supported_config(
     }
 
     let package_operations_path = apply_package_operations(state_dir, &actions, package_executor)?;
-    let pacman_transaction = resolve_pacman_transaction_for_actions(&actions)?;
+    let transactions = resolve_package_transactions_for_actions(&actions)?;
     let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
 
     let record = RunRecord::apply(config_dir, actions.clone(), current);
@@ -225,7 +229,9 @@ pub fn apply_supported_config(
             pacman_snapshot_after: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
-            pacman_transaction: Some(pacman_transaction),
+            pacman_transaction: Some(transactions.pacman),
+            aur_transaction: Some(transactions.aur),
+            nix_transaction: Some(transactions.nix),
         },
     )?;
     let _ = lock.path();
@@ -242,19 +248,30 @@ pub fn apply_supported_config(
     })
 }
 
-fn resolve_pacman_transaction_for_actions(
+struct PackageTransactions {
+    pacman: PackageTransaction,
+    aur: PackageTransaction,
+    nix: PackageTransaction,
+}
+
+fn resolve_package_transactions_for_actions(
     actions: &[Action],
-) -> Result<PackageTransaction, String> {
-    let packages: Vec<String> = actions
+) -> Result<PackageTransactions, String> {
+    Ok(PackageTransactions {
+        pacman: resolve_pacman_install_transaction(&packages_for_backend(
+            actions,
+            "packages.pacman.",
+        ))?,
+        aur: resolve_aur_install_transaction(&packages_for_backend(actions, "packages.aur."))?,
+        nix: resolve_nix_install_transaction(&packages_for_backend(actions, "packages.nix."))?,
+    })
+}
+
+fn packages_for_backend(actions: &[Action], prefix: &str) -> Vec<String> {
+    actions
         .iter()
-        .filter_map(|action| {
-            action
-                .id
-                .strip_prefix("packages.pacman.")
-                .map(ToOwned::to_owned)
-        })
-        .collect();
-    resolve_pacman_install_transaction(&packages)
+        .filter_map(|action| action.id.strip_prefix(prefix).map(ToOwned::to_owned))
+        .collect()
 }
 
 fn apply_package_operations(

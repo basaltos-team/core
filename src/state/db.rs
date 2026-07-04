@@ -21,6 +21,8 @@ pub struct StateDbArtifacts {
     pub pacman_snapshot_before: Option<PackageSnapshot>,
     pub pacman_snapshot_after: Option<PackageSnapshot>,
     pub pacman_transaction: Option<PackageTransaction>,
+    pub aur_transaction: Option<PackageTransaction>,
+    pub nix_transaction: Option<PackageTransaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +162,12 @@ pub fn index_run(
     .map_err(|err| format!("failed to replace indexed package transactions: {err}"))?;
     if let Some(transaction) = &artifacts.pacman_transaction {
         index_package_transaction(&tx, &record.id, PackageBackend::Pacman, transaction)?;
+    }
+    if let Some(transaction) = &artifacts.aur_transaction {
+        index_package_transaction(&tx, &record.id, PackageBackend::Aur, transaction)?;
+    }
+    if let Some(transaction) = &artifacts.nix_transaction {
+        index_package_transaction(&tx, &record.id, PackageBackend::Nix, transaction)?;
     }
 
     tx.execute(
@@ -805,7 +813,11 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let package_log = base.join("package-operations.log");
         let service_log = base.join("service-operations.log");
-        fs::write(&package_log, "pacman ensure-installed basalt-test\n").unwrap();
+        fs::write(
+            &package_log,
+            "pacman ensure-installed basalt-test\naur ensure-installed yay-bin\nnix ensure-installed hello\n",
+        )
+        .unwrap();
         fs::write(&service_log, "enable basalt-example.service\n").unwrap();
 
         let action = Action {
@@ -814,9 +826,21 @@ mod tests {
             description: "ensure pacman package `basalt-test` is installed".to_string(),
             risk: Risk::High,
         };
+        let aur_action = Action {
+            id: "packages.aur.yay-bin".to_string(),
+            domain: "packages".to_string(),
+            description: "ensure AUR package `yay-bin` is installed".to_string(),
+            risk: Risk::High,
+        };
+        let nix_action = Action {
+            id: "packages.nix.hello".to_string(),
+            domain: "packages".to_string(),
+            description: "ensure Nix package `hello` is installed".to_string(),
+            risk: Risk::High,
+        };
         let record = RunRecord::apply(
             PathBuf::from("config"),
-            vec![action],
+            vec![action, aur_action, nix_action],
             &CurrentState::default(),
         );
         let artifacts = StateDbArtifacts {
@@ -841,6 +865,12 @@ mod tests {
                     reason: PackageReason::Explicit,
                 }],
             }),
+            aur_transaction: Some(crate::backends::pacman::PackageTransaction::skipped(
+                "AUR transaction resolution is not implemented yet",
+            )),
+            nix_transaction: Some(crate::backends::pacman::PackageTransaction::skipped(
+                "Nix transaction resolution is not implemented yet",
+            )),
         };
 
         let db_path = index_run(&base, &record, &artifacts).unwrap();
@@ -849,18 +879,26 @@ mod tests {
         let rows = history_rows(&base, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].mode, "apply");
-        assert_eq!(rows[0].action_count, 1);
-        assert_eq!(rows[0].package_operation_count, 1);
+        assert_eq!(rows[0].action_count, 3);
+        assert_eq!(rows[0].package_operation_count, 3);
         assert_eq!(rows[0].service_operation_count, 1);
 
         let inspection = inspect_run(&base, Some(&record.id)).unwrap();
         assert_eq!(
             inspection.declared_packages,
-            vec!["packages.pacman.basalt-test"]
+            vec![
+                "packages.pacman.basalt-test",
+                "packages.aur.yay-bin",
+                "packages.nix.hello"
+            ]
         );
         assert_eq!(
             inspection.package_transaction_statuses,
-            vec!["pacman: resolved"]
+            vec![
+                "aur: skipped - AUR transaction resolution is not implemented yet",
+                "nix: skipped - Nix transaction resolution is not implemented yet",
+                "pacman: resolved"
+            ]
         );
         assert_eq!(
             inspection.resolved_package_transactions,
@@ -868,7 +906,11 @@ mod tests {
         );
         assert_eq!(
             inspection.requested_package_operations,
-            vec!["pacman ensure-installed basalt-test"]
+            vec![
+                "pacman ensure-installed basalt-test",
+                "aur ensure-installed yay-bin",
+                "nix ensure-installed hello"
+            ]
         );
         assert_eq!(
             inspection.package_snapshot_changes,
