@@ -53,6 +53,34 @@ pub fn read_installed_package_snapshot() -> PackageSnapshot {
     PackageSnapshot { packages }
 }
 
+pub fn resolve_pacman_install_transaction(
+    packages: &[String],
+) -> Result<PackageTransaction, String> {
+    let packages: Vec<&str> = packages
+        .iter()
+        .map(String::as_str)
+        .filter(|package| !package.trim().is_empty())
+        .collect();
+    if packages.is_empty() {
+        return Ok(PackageTransaction::default());
+    }
+
+    let mut args = vec!["-Sp", "--needed", "--print-format", "%n\t%v"];
+    args.extend(packages);
+
+    let output = match run_capture("pacman", &args) {
+        Ok(output) => output,
+        Err(_) => return Ok(PackageTransaction::default()),
+    };
+    if output.status_code != Some(0) {
+        return Ok(PackageTransaction::default());
+    }
+
+    Ok(PackageTransaction {
+        rows: parse_pacman_print_format(&output.stdout),
+    })
+}
+
 fn read_explicit_package_names() -> BTreeSet<String> {
     let Ok(output) = run_capture("pacman", &["-Qqe"]) else {
         return BTreeSet::new();
@@ -145,6 +173,32 @@ pub struct PackageSnapshotDiff {
     pub unchanged: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageTransaction {
+    pub rows: Vec<PackageTransactionRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageTransactionRow {
+    pub package: String,
+    pub version: Option<String>,
+    pub change: PackageTransactionChange,
+    pub reason: PackageReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageTransactionChange {
+    Install,
+}
+
+impl PackageTransactionChange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageBackend {
     Pacman,
@@ -224,6 +278,32 @@ pub fn write_package_operations_log(
     Ok(Some(path))
 }
 
+fn parse_pacman_print_format(stdout: &str) -> Vec<PackageTransactionRow> {
+    let mut rows = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut fields = line.splitn(2, '\t');
+        let Some(name) = fields.next().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let version = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        rows.push(PackageTransactionRow {
+            package: name.to_string(),
+            version,
+            change: PackageTransactionChange::Install,
+            reason: PackageReason::Unknown,
+        });
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +351,15 @@ mod tests {
         assert_eq!(diff.added, BTreeSet::from(["rust".to_string()]));
         assert_eq!(diff.removed, BTreeSet::from(["openssl".to_string()]));
         assert_eq!(diff.unchanged, BTreeSet::from(["git".to_string()]));
+    }
+
+    #[test]
+    fn parses_pacman_print_format_transaction_rows() {
+        let rows = parse_pacman_print_format("git\t2.50.0-1\nperl-error\t0.17030-1\n");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].package, "git");
+        assert_eq!(rows[0].version.as_deref(), Some("2.50.0-1"));
+        assert_eq!(rows[0].change, PackageTransactionChange::Install);
     }
 }

@@ -1,8 +1,8 @@
 // Apply pipeline orchestration.
 
 use crate::backends::pacman::{
-    write_package_operations_log, PackageBackend, PackageExecutor, PackageSnapshot,
-    RecordingPackageExecutor,
+    resolve_pacman_install_transaction, write_package_operations_log, PackageBackend,
+    PackageExecutor, PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
@@ -75,6 +75,7 @@ pub fn write_dry_run_record(
     current: &CurrentState,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let record = RunRecord::dry_run(config_dir, actions, current);
+    let pacman_transaction = resolve_pacman_transaction_for_actions(&record.actions)?;
     let (run_path, latest_path) = write_run_record(state_dir, &record)?;
     index_run(
         state_dir,
@@ -88,6 +89,7 @@ pub fn write_dry_run_record(
             pacman_snapshot_after: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
+            pacman_transaction: Some(pacman_transaction),
             ..StateDbArtifacts::default()
         },
     )?;
@@ -203,6 +205,7 @@ pub fn apply_supported_config(
     }
 
     let package_operations_path = apply_package_operations(state_dir, &actions, package_executor)?;
+    let pacman_transaction = resolve_pacman_transaction_for_actions(&actions)?;
     let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
 
     let record = RunRecord::apply(config_dir, actions.clone(), current);
@@ -222,6 +225,7 @@ pub fn apply_supported_config(
             pacman_snapshot_after: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
+            pacman_transaction: Some(pacman_transaction),
         },
     )?;
     let _ = lock.path();
@@ -236,6 +240,21 @@ pub fn apply_supported_config(
         run_path,
         latest_path,
     })
+}
+
+fn resolve_pacman_transaction_for_actions(
+    actions: &[Action],
+) -> Result<PackageTransaction, String> {
+    let packages: Vec<String> = actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .id
+                .strip_prefix("packages.pacman.")
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    resolve_pacman_install_transaction(&packages)
 }
 
 fn apply_package_operations(

@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
-use crate::backends::pacman::PackageSnapshot;
+use crate::backends::pacman::{PackageBackend, PackageSnapshot, PackageTransaction};
 use crate::state::store::RunRecord;
 
 const STATE_DB: &str = "state.db";
-const MIGRATION_VERSION: i64 = 2;
+const MIGRATION_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct StateDbArtifacts {
@@ -20,6 +20,7 @@ pub struct StateDbArtifacts {
     pub backup_dir: Option<PathBuf>,
     pub pacman_snapshot_before: Option<PackageSnapshot>,
     pub pacman_snapshot_after: Option<PackageSnapshot>,
+    pub pacman_transaction: Option<PackageTransaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub struct HistoryRow {
 pub struct RunInspection {
     pub id: String,
     pub declared_packages: Vec<String>,
+    pub resolved_package_transactions: Vec<String>,
     pub requested_package_operations: Vec<String>,
     pub package_snapshot_changes: Vec<String>,
 }
@@ -143,6 +145,20 @@ pub fn index_run(
     .map_err(|err| format!("failed to replace indexed service operations: {err}"))?;
     if let Some(path) = &artifacts.service_operations_path {
         index_service_operations(&tx, &record.id, path)?;
+    }
+
+    tx.execute(
+        "delete from package_transaction_rows where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package transaction rows: {err}"))?;
+    tx.execute(
+        "delete from package_transactions where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package transactions: {err}"))?;
+    if let Some(transaction) = &artifacts.pacman_transaction {
+        index_package_transaction(&tx, &record.id, PackageBackend::Pacman, transaction)?;
     }
 
     tx.execute(
@@ -254,6 +270,7 @@ pub fn inspect_run(state_dir: &Path, run_id: Option<&str>) -> Result<RunInspecti
 
     Ok(RunInspection {
         declared_packages: declared_packages(&conn, &id)?,
+        resolved_package_transactions: resolved_package_transactions(&conn, &id)?,
         requested_package_operations: requested_package_operations(&conn, &id)?,
         package_snapshot_changes: package_snapshot_changes(&conn, &id)?,
         id,
@@ -268,6 +285,11 @@ pub fn render_run_inspection(inspection: &RunInspection) -> String {
         &mut out,
         "Declared package intent",
         &inspection.declared_packages,
+    );
+    push_list(
+        &mut out,
+        "Resolved package transactions",
+        &inspection.resolved_package_transactions,
     );
     push_list(
         &mut out,
@@ -366,12 +388,33 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             foreign key (run_id) references runs(id) on delete cascade
         );
 
+        create table if not exists package_transactions (
+            run_id text not null,
+            backend text not null,
+            row_count integer not null,
+            primary key (run_id, backend),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists package_transaction_rows (
+            run_id text not null,
+            backend text not null,
+            row_index integer not null,
+            package text not null,
+            version text,
+            change text not null,
+            reason text not null,
+            primary key (run_id, backend, row_index),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
         create index if not exists idx_runs_created_at on runs(created_at);
         create index if not exists idx_actions_domain on actions(domain);
         create index if not exists idx_package_operations_package on package_operations(package);
         create index if not exists idx_service_operations_service on service_operations(service);
         create index if not exists idx_package_snapshot_packages_package on package_snapshot_packages(package);
         create index if not exists idx_package_snapshot_diff_change on package_snapshot_diff(change);
+        create index if not exists idx_package_transaction_rows_package on package_transaction_rows(package);
         ",
     )
     .map_err(|err| format!("failed to migrate state database: {err}"))?;
@@ -487,6 +530,54 @@ fn index_package_snapshot(
     Ok(())
 }
 
+fn index_package_transaction(
+    conn: &Connection,
+    run_id: &str,
+    backend: PackageBackend,
+    transaction: &PackageTransaction,
+) -> Result<(), String> {
+    let backend = backend.as_str();
+    conn.execute(
+        "insert into package_transactions (
+            run_id,
+            backend,
+            row_count
+        ) values (?1, ?2, ?3)",
+        params![run_id, backend, transaction.rows.len() as i64],
+    )
+    .map_err(|err| format!("failed to index {backend} package transaction: {err}"))?;
+
+    for (index, row) in transaction.rows.iter().enumerate() {
+        conn.execute(
+            "insert into package_transaction_rows (
+                run_id,
+                backend,
+                row_index,
+                package,
+                version,
+                change,
+                reason
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run_id,
+                backend,
+                index as i64,
+                row.package,
+                row.version,
+                row.change.as_str(),
+                row.reason.as_str(),
+            ],
+        )
+        .map_err(|err| {
+            format!(
+                "failed to index package transaction row `{}`: {err}",
+                row.package
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn index_package_snapshot_diff(
     conn: &Connection,
     run_id: &str,
@@ -556,6 +647,22 @@ fn requested_package_operations(conn: &Connection, run_id: &str) -> Result<Vec<S
     collect_string_rows(rows)
 }
 
+fn resolved_package_transactions(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select backend || ' ' || change || ' ' || package ||
+                coalesce(' ' || version, '') || ' [' || reason || ']'
+            from package_transaction_rows
+            where run_id = ?1
+            order by backend, row_index",
+        )
+        .map_err(|err| format!("failed to prepare package transaction inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package transactions: {err}"))?;
+    collect_string_rows(rows)
+}
+
 fn package_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
@@ -609,6 +716,7 @@ fn push_list(out: &mut String, heading: &str, values: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::pacman::{PackageReason, PackageTransactionChange, PackageTransactionRow};
     use crate::planning::action::{Action, Risk};
     use crate::state::store::{CurrentState, RunRecord};
 
@@ -654,6 +762,14 @@ mod tests {
             pacman_snapshot_after: Some(crate::backends::pacman::PackageSnapshot::from_names(
                 std::collections::BTreeSet::from(["basalt-test".to_string()]),
             )),
+            pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
+                rows: vec![PackageTransactionRow {
+                    package: "basalt-test".to_string(),
+                    version: Some("1.0-1".to_string()),
+                    change: PackageTransactionChange::Install,
+                    reason: PackageReason::Unknown,
+                }],
+            }),
         };
 
         let db_path = index_run(&base, &record, &artifacts).unwrap();
@@ -670,6 +786,10 @@ mod tests {
         assert_eq!(
             inspection.declared_packages,
             vec!["packages.pacman.basalt-test"]
+        );
+        assert_eq!(
+            inspection.resolved_package_transactions,
+            vec!["pacman install basalt-test 1.0-1 [unknown]"]
         );
         assert_eq!(
             inspection.requested_package_operations,
@@ -690,6 +810,7 @@ mod tests {
 
         let inspection_rendered = render_run_inspection(&inspection);
         assert!(inspection_rendered.contains("Declared package intent"));
+        assert!(inspection_rendered.contains("Resolved package transactions"));
         assert!(inspection_rendered.contains("Actual package snapshot changes"));
 
         let _ = fs::remove_dir_all(base);
