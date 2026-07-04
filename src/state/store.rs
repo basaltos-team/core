@@ -260,7 +260,7 @@ mod tests {
             ..CurrentState::default()
         };
         let record = RunRecord::dry_run(
-            PathBuf::from("../basalt-configs/examples/minimal"),
+            PathBuf::from("../configs/examples/minimal"),
             vec![action],
             &state,
         );
@@ -281,7 +281,7 @@ mod tests {
             risk: crate::planning::action::Risk::Medium,
         };
         let record = RunRecord::apply(
-            PathBuf::from("../basalt-configs/fixtures/valid-system-apply"),
+            PathBuf::from("../configs/fixtures/valid-system-apply"),
             vec![action],
             &CurrentState::default(),
         );

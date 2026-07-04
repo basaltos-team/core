@@ -14,10 +14,10 @@ Rust implementation repository for the BasaltOS control plane.
 
 ## Does Not Own
 
-- PKGBUILDs for distro packages. Those live in `basalt-packages/`.
-- ISO profile and live installer environment. Those live in `basalt-iso/`.
-- Published pacman repository metadata. That lives in `basalt-repo/`.
-- Long-form user docs. Those live in `basalt-docs/`.
+- PKGBUILDs for distro packages. Those live in `packages/`.
+- ISO profile and live installer environment. Those live in `iso/`.
+- Published pacman repository metadata. That lives in `repo-manifests/`.
+- Long-form user docs. Those live in `docs/`.
 
 ## Planned Layout
 
@@ -57,5 +57,5 @@ basalt/
 Implement:
 
 ```sh
-basalt validate --config ../basalt-configs/examples/minimal
+basalt validate --config ../configs/examples/minimal
 ```

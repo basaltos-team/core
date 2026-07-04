@@ -258,7 +258,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/valid-basic");
+            .join("configs/fixtures/valid-basic");
 
         let config = validate_config_dir(&root).unwrap();
         assert_eq!(config.domain_count(), 3);
@@ -271,7 +271,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/invalid-unknown-field");
+            .join("configs/fixtures/invalid-unknown-field");
 
         let errors = validate_config_dir(&root).unwrap_err();
         assert!(errors
@@ -284,7 +284,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/invalid-duplicate-domain");
+            .join("configs/fixtures/invalid-duplicate-domain");
 
         let errors = validate_config_dir(&root).unwrap_err();
         assert!(errors
@@ -297,7 +297,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/invalid-lua-sandbox");
+            .join("configs/fixtures/invalid-lua-sandbox");
 
         let errors = validate_config_dir(&root).unwrap_err();
         assert!(errors.iter().any(|err| {

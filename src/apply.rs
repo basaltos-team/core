@@ -428,7 +428,7 @@ mod tests {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/valid-system-apply");
+            .join("configs/fixtures/valid-system-apply");
         let config = validate_config_dir(&config_dir).unwrap();
         let summary = apply_supported_config(
             &state,
@@ -473,7 +473,7 @@ mod tests {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/valid-package-recording");
+            .join("configs/fixtures/valid-package-recording");
         let config = validate_config_dir(&config_dir).unwrap();
         let summary = apply_supported_config(
             &state,
@@ -508,7 +508,7 @@ mod tests {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/fixtures/valid-managed-files");
+            .join("configs/fixtures/valid-managed-files");
         let config = validate_config_dir(&config_dir).unwrap();
         let summary = apply_supported_config(
             &state,

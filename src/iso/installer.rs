@@ -1,2 +1,1 @@
-// Installer command logic shared with basalt-iso.
-
+// Installer command logic shared with the ISO repo.

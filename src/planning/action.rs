@@ -148,7 +148,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/examples/minimal");
+            .join("configs/examples/minimal");
         let config = validate_config_dir(&root).unwrap();
         let actions = plan_actions(&config, &CurrentState::default());
 
@@ -166,7 +166,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("basalt-configs/examples/minimal");
+            .join("configs/examples/minimal");
         let config = validate_config_dir(&root).unwrap();
         let mut current = CurrentState {
             hostname: Some("basalt-vm".to_string()),
