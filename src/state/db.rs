@@ -9,7 +9,7 @@ use crate::backends::pacman::{PackageBackend, PackageSnapshot, PackageTransactio
 use crate::state::store::RunRecord;
 
 const STATE_DB: &str = "state.db";
-const MIGRATION_VERSION: i64 = 3;
+const MIGRATION_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Default)]
 pub struct StateDbArtifacts {
@@ -38,6 +38,7 @@ pub struct HistoryRow {
 pub struct RunInspection {
     pub id: String,
     pub declared_packages: Vec<String>,
+    pub package_transaction_statuses: Vec<String>,
     pub resolved_package_transactions: Vec<String>,
     pub requested_package_operations: Vec<String>,
     pub package_snapshot_changes: Vec<String>,
@@ -270,6 +271,7 @@ pub fn inspect_run(state_dir: &Path, run_id: Option<&str>) -> Result<RunInspecti
 
     Ok(RunInspection {
         declared_packages: declared_packages(&conn, &id)?,
+        package_transaction_statuses: package_transaction_statuses(&conn, &id)?,
         resolved_package_transactions: resolved_package_transactions(&conn, &id)?,
         requested_package_operations: requested_package_operations(&conn, &id)?,
         package_snapshot_changes: package_snapshot_changes(&conn, &id)?,
@@ -285,6 +287,11 @@ pub fn render_run_inspection(inspection: &RunInspection) -> String {
         &mut out,
         "Declared package intent",
         &inspection.declared_packages,
+    );
+    push_list(
+        &mut out,
+        "Package transaction resolution",
+        &inspection.package_transaction_statuses,
     );
     push_list(
         &mut out,
@@ -392,6 +399,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             run_id text not null,
             backend text not null,
             row_count integer not null,
+            status text not null default 'resolved',
+            message text,
             primary key (run_id, backend),
             foreign key (run_id) references runs(id) on delete cascade
         );
@@ -418,6 +427,13 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|err| format!("failed to migrate state database: {err}"))?;
+    add_column_if_missing(
+        conn,
+        "package_transactions",
+        "status",
+        "status text not null default 'resolved'",
+    )?;
+    add_column_if_missing(conn, "package_transactions", "message", "message text")?;
 
     conn.execute(
         "insert or ignore into schema_migrations (version) values (?1)",
@@ -541,9 +557,17 @@ fn index_package_transaction(
         "insert into package_transactions (
             run_id,
             backend,
-            row_count
-        ) values (?1, ?2, ?3)",
-        params![run_id, backend, transaction.rows.len() as i64],
+            row_count,
+            status,
+            message
+        ) values (?1, ?2, ?3, ?4, ?5)",
+        params![
+            run_id,
+            backend,
+            transaction.rows.len() as i64,
+            transaction.status.as_str(),
+            transaction.message,
+        ],
     )
     .map_err(|err| format!("failed to index {backend} package transaction: {err}"))?;
 
@@ -647,6 +671,25 @@ fn requested_package_operations(conn: &Connection, run_id: &str) -> Result<Vec<S
     collect_string_rows(rows)
 }
 
+fn package_transaction_statuses(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select backend || ': ' || status ||
+                case
+                    when message is null or message = '' then ''
+                    else ' - ' || message
+                end
+            from package_transactions
+            where run_id = ?1
+            order by backend",
+        )
+        .map_err(|err| format!("failed to prepare package transaction status inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package transaction statuses: {err}"))?;
+    collect_string_rows(rows)
+}
+
 fn resolved_package_transactions(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
@@ -713,10 +756,36 @@ fn push_list(out: &mut String, heading: &str, values: &[String]) {
     }
 }
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|err| format!("failed to inspect table `{table}`: {err}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to inspect table `{table}`: {err}"))?;
+    for existing in columns {
+        let existing =
+            existing.map_err(|err| format!("failed to inspect table `{table}`: {err}"))?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+    conn.execute(&format!("alter table {table} add column {definition}"), [])
+        .map_err(|err| format!("failed to add `{table}.{column}`: {err}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::pacman::{PackageReason, PackageTransactionChange, PackageTransactionRow};
+    use crate::backends::pacman::{
+        PackageReason, PackageResolutionStatus, PackageTransactionChange, PackageTransactionRow,
+    };
     use crate::planning::action::{Action, Risk};
     use crate::state::store::{CurrentState, RunRecord};
 
@@ -763,6 +832,8 @@ mod tests {
                 std::collections::BTreeSet::from(["basalt-test".to_string()]),
             )),
             pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
+                status: PackageResolutionStatus::Resolved,
+                message: None,
                 rows: vec![PackageTransactionRow {
                     package: "basalt-test".to_string(),
                     version: Some("1.0-1".to_string()),
@@ -788,6 +859,10 @@ mod tests {
             vec!["packages.pacman.basalt-test"]
         );
         assert_eq!(
+            inspection.package_transaction_statuses,
+            vec!["pacman: resolved"]
+        );
+        assert_eq!(
             inspection.resolved_package_transactions,
             vec!["pacman install basalt-test 1.0-1 [explicit]"]
         );
@@ -810,6 +885,7 @@ mod tests {
 
         let inspection_rendered = render_run_inspection(&inspection);
         assert!(inspection_rendered.contains("Declared package intent"));
+        assert!(inspection_rendered.contains("Package transaction resolution"));
         assert!(inspection_rendered.contains("Resolved package transactions"));
         assert!(inspection_rendered.contains("Actual package snapshot changes"));
 

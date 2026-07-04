@@ -63,7 +63,7 @@ pub fn resolve_pacman_install_transaction(
         .map(ToOwned::to_owned)
         .collect();
     if requested.is_empty() {
-        return Ok(PackageTransaction::default());
+        return Ok(PackageTransaction::skipped("no pacman packages requested"));
     }
 
     let mut args = vec!["-Sp", "--needed", "--print-format", "%n\t%v"];
@@ -71,13 +71,26 @@ pub fn resolve_pacman_install_transaction(
 
     let output = match run_capture("pacman", &args) {
         Ok(output) => output,
-        Err(_) => return Ok(PackageTransaction::default()),
+        Err(err) => {
+            return Ok(PackageTransaction::unavailable(format!(
+                "pacman transaction resolution unavailable: {err}"
+            )))
+        }
     };
     if output.status_code != Some(0) {
-        return Ok(PackageTransaction::default());
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        return Ok(PackageTransaction::failed(format!(
+            "pacman transaction resolution failed: {detail}"
+        )));
     }
 
     Ok(PackageTransaction {
+        status: PackageResolutionStatus::Resolved,
+        message: None,
         rows: parse_pacman_print_format(&output.stdout, &requested),
     })
 }
@@ -174,9 +187,62 @@ pub struct PackageSnapshotDiff {
     pub unchanged: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageTransaction {
+    pub status: PackageResolutionStatus,
+    pub message: Option<String>,
     pub rows: Vec<PackageTransactionRow>,
+}
+
+impl PackageTransaction {
+    pub fn skipped(message: impl Into<String>) -> Self {
+        Self {
+            status: PackageResolutionStatus::Skipped,
+            message: Some(message.into()),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: PackageResolutionStatus::Unavailable,
+            message: Some(message.into()),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: PackageResolutionStatus::Failed,
+            message: Some(message.into()),
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl Default for PackageTransaction {
+    fn default() -> Self {
+        Self::skipped("no transaction resolution attempted")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageResolutionStatus {
+    Skipped,
+    Unavailable,
+    Failed,
+    Resolved,
+}
+
+impl PackageResolutionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+            Self::Resolved => "resolved",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,5 +441,13 @@ mod tests {
         assert_eq!(rows[0].change, PackageTransactionChange::Install);
         assert_eq!(rows[0].reason, PackageReason::Explicit);
         assert_eq!(rows[1].reason, PackageReason::Dependency);
+    }
+
+    #[test]
+    fn default_transaction_records_skipped_status() {
+        let transaction = PackageTransaction::default();
+
+        assert_eq!(transaction.status, PackageResolutionStatus::Skipped);
+        assert!(transaction.message.unwrap().contains("no transaction"));
     }
 }
