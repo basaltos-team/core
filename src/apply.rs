@@ -256,7 +256,7 @@ fn write_with_backup(
     written_files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let target = root_dir.join(relative_path);
-    backup_existing(&target, backup_dir, relative_path)?;
+    crate::recovery::restore::backup_target(&target, backup_dir, relative_path)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
@@ -284,7 +284,7 @@ fn set_timezone(
     }
 
     let target = root_dir.join("etc/localtime");
-    backup_existing(&target, backup_dir, "etc/localtime")?;
+    crate::recovery::restore::backup_target(&target, backup_dir, "etc/localtime")?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
@@ -303,28 +303,6 @@ fn set_timezone(
     }
 
     written_files.push(target);
-    Ok(())
-}
-
-fn backup_existing(target: &Path, backup_dir: &Path, relative_path: &str) -> Result<(), String> {
-    if !target.exists() && !target.is_symlink() {
-        return Ok(());
-    }
-
-    let backup_path = backup_dir.join(relative_path.replace('/', "__"));
-    if target.is_symlink() {
-        let link = fs::read_link(target).map_err(|err| format!("{}: {err}", target.display()))?;
-        fs::write(&backup_path, link.display().to_string())
-            .map_err(|err| format!("{}: {err}", backup_path.display()))?;
-    } else {
-        fs::copy(target, &backup_path).map_err(|err| {
-            format!(
-                "failed to back up {} to {}: {err}",
-                target.display(),
-                backup_path.display()
-            )
-        })?;
-    }
     Ok(())
 }
 
@@ -455,6 +433,10 @@ mod tests {
         );
         assert!(root.join("etc/localtime").exists() || root.join("etc/localtime").is_symlink());
         assert!(summary.backup_dir.join("etc__hostname").exists());
+        assert!(summary
+            .backup_dir
+            .join(crate::recovery::restore::BACKUP_MANIFEST)
+            .exists());
         assert!(summary.run_path.exists());
         assert!(summary.latest_path.exists());
         assert!(!state.join("basalt.lock").exists());

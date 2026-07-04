@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod planning;
 mod process;
+mod recovery;
 mod state;
 mod system;
 

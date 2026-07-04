@@ -186,6 +186,44 @@ pub fn run(args: Vec<String>) -> i32 {
                 }
             }
         }
+        Ok(Command::Restore {
+            backup_dir,
+            root_dir,
+            yes,
+        }) => {
+            if !yes {
+                eprintln!("restore requires `--yes`");
+                return 1;
+            }
+            match crate::recovery::restore::restore_backup(&root_dir, &backup_dir) {
+                Ok(summary) => {
+                    println!("Basalt restore");
+                    println!();
+                    println!("Backup directory: {}", backup_dir.display());
+                    println!("Restored files:");
+                    if summary.restored.is_empty() {
+                        println!("- none");
+                    } else {
+                        for path in summary.restored {
+                            println!("- {}", path.display());
+                        }
+                    }
+                    println!("Removed files:");
+                    if summary.removed.is_empty() {
+                        println!("- none");
+                    } else {
+                        for path in summary.removed {
+                            println!("- {}", path.display());
+                        }
+                    }
+                    0
+                }
+                Err(err) => {
+                    eprintln!("restore failed: {err}");
+                    1
+                }
+            }
+        }
         Ok(Command::Help) => {
             print_help();
             0
@@ -222,6 +260,11 @@ enum Command {
         state_dir: PathBuf,
         limit: usize,
     },
+    Restore {
+        backup_dir: PathBuf,
+        root_dir: PathBuf,
+        yes: bool,
+    },
     Help,
 }
 
@@ -236,6 +279,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "apply" => parse_apply(args),
         "schema" => Ok(Command::Schema),
         "history" => parse_history(args),
+        "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
     }
@@ -407,6 +451,41 @@ fn parse_history(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_restore(args: &[String]) -> Result<Command, String> {
+    let mut backup_dir = None;
+    let mut root_dir = None;
+    let mut yes = false;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--backup" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--backup` requires a backup directory path".to_string())?;
+                backup_dir = Some(PathBuf::from(value));
+            }
+            "--root" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--root` requires a directory path".to_string())?;
+                root_dir = Some(PathBuf::from(value));
+            }
+            "--yes" => yes = true,
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::Restore {
+        backup_dir: backup_dir.ok_or_else(|| "`restore` requires `--backup <path>`".to_string())?,
+        root_dir: root_dir.unwrap_or_else(|| PathBuf::from("/")),
+        yes,
+    })
+}
+
 fn print_help() {
     println!("basalt");
     println!();
@@ -416,5 +495,6 @@ fn print_help() {
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record] [--service-executor record|host]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
+    println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }
