@@ -186,6 +186,18 @@ pub fn run(args: Vec<String>) -> i32 {
                 }
             }
         }
+        Ok(Command::InspectRun { state_dir, run_id }) => {
+            match crate::state::db::inspect_run(&state_dir, run_id.as_deref()) {
+                Ok(inspection) => {
+                    print!("{}", crate::state::db::render_run_inspection(&inspection));
+                    0
+                }
+                Err(err) => {
+                    eprintln!("inspect-run failed: {err}");
+                    1
+                }
+            }
+        }
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -260,6 +272,10 @@ enum Command {
         state_dir: PathBuf,
         limit: usize,
     },
+    InspectRun {
+        state_dir: PathBuf,
+        run_id: Option<String>,
+    },
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -279,6 +295,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "apply" => parse_apply(args),
         "schema" => Ok(Command::Schema),
         "history" => parse_history(args),
+        "inspect-run" => parse_inspect_run(args),
         "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
@@ -451,6 +468,38 @@ fn parse_history(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_inspect_run(args: &[String]) -> Result<Command, String> {
+    let mut state_dir = None;
+    let mut run_id = None;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--state-dir` requires a directory path".to_string())?;
+                state_dir = Some(PathBuf::from(value));
+            }
+            "--run" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--run` requires `latest` or a run id".to_string())?;
+                run_id = Some(value.to_string());
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::InspectRun {
+        state_dir: state_dir.unwrap_or_else(|| PathBuf::from("./target/basalt-state")),
+        run_id,
+    })
+}
+
 fn parse_restore(args: &[String]) -> Result<Command, String> {
     let mut backup_dir = None;
     let mut root_dir = None;
@@ -495,6 +544,7 @@ fn print_help() {
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record] [--service-executor record|host]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
+    println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }

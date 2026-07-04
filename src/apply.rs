@@ -1,7 +1,8 @@
 // Apply pipeline orchestration.
 
 use crate::backends::pacman::{
-    write_package_operations_log, PackageBackend, PackageExecutor, RecordingPackageExecutor,
+    write_package_operations_log, PackageBackend, PackageExecutor, PackageSnapshot,
+    RecordingPackageExecutor,
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
@@ -81,6 +82,12 @@ pub fn write_dry_run_record(
         &StateDbArtifacts {
             run_json_path: run_path.clone(),
             latest_json_path: latest_path.clone(),
+            pacman_snapshot_before: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
+            pacman_snapshot_after: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
             ..StateDbArtifacts::default()
         },
     )?;
@@ -209,6 +216,12 @@ pub fn apply_supported_config(
             package_operations_path: package_operations_path.clone(),
             service_operations_path: service_operations_path.clone(),
             backup_dir: Some(backup_dir.clone()),
+            pacman_snapshot_before: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
+            pacman_snapshot_after: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
         },
     )?;
     let _ = lock.path();

@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
+use crate::backends::pacman::PackageSnapshot;
 use crate::state::store::RunRecord;
 
 const STATE_DB: &str = "state.db";
-const MIGRATION_VERSION: i64 = 1;
+const MIGRATION_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct StateDbArtifacts {
@@ -17,6 +18,8 @@ pub struct StateDbArtifacts {
     pub package_operations_path: Option<PathBuf>,
     pub service_operations_path: Option<PathBuf>,
     pub backup_dir: Option<PathBuf>,
+    pub pacman_snapshot_before: Option<PackageSnapshot>,
+    pub pacman_snapshot_after: Option<PackageSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,14 @@ pub struct HistoryRow {
     pub created_at: String,
     pub package_operation_count: usize,
     pub service_operation_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunInspection {
+    pub id: String,
+    pub declared_packages: Vec<String>,
+    pub requested_package_operations: Vec<String>,
+    pub package_snapshot_changes: Vec<String>,
 }
 
 pub fn init_state_db(state_dir: &Path) -> Result<PathBuf, String> {
@@ -134,6 +145,34 @@ pub fn index_run(
         index_service_operations(&tx, &record.id, path)?;
     }
 
+    tx.execute(
+        "delete from package_snapshot_packages where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package snapshots: {err}"))?;
+    tx.execute(
+        "delete from package_snapshots where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package snapshot metadata: {err}"))?;
+    tx.execute(
+        "delete from package_snapshot_diff where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package snapshot diff: {err}"))?;
+    if let Some(snapshot) = &artifacts.pacman_snapshot_before {
+        index_package_snapshot(&tx, &record.id, "before", "pacman", snapshot)?;
+    }
+    if let Some(snapshot) = &artifacts.pacman_snapshot_after {
+        index_package_snapshot(&tx, &record.id, "after", "pacman", snapshot)?;
+    }
+    if let (Some(before), Some(after)) = (
+        &artifacts.pacman_snapshot_before,
+        &artifacts.pacman_snapshot_after,
+    ) {
+        index_package_snapshot_diff(&tx, &record.id, "pacman", before, after)?;
+    }
+
     tx.commit()
         .map_err(|err| format!("{}: {err}", db_path.display()))?;
     Ok(db_path)
@@ -205,6 +244,44 @@ pub fn render_history(rows: &[HistoryRow]) -> String {
     out
 }
 
+pub fn inspect_run(state_dir: &Path, run_id: Option<&str>) -> Result<RunInspection, String> {
+    let db_path = init_state_db(state_dir)?;
+    let conn = open_connection(&db_path)?;
+    let id = match run_id {
+        Some("latest") | None => latest_run_id(&conn)?,
+        Some(id) => id.to_string(),
+    };
+
+    Ok(RunInspection {
+        declared_packages: declared_packages(&conn, &id)?,
+        requested_package_operations: requested_package_operations(&conn, &id)?,
+        package_snapshot_changes: package_snapshot_changes(&conn, &id)?,
+        id,
+    })
+}
+
+pub fn render_run_inspection(inspection: &RunInspection) -> String {
+    let mut out = String::new();
+    out.push_str("Basalt run inspection\n\n");
+    out.push_str(&format!("Run: {}\n\n", inspection.id));
+    push_list(
+        &mut out,
+        "Declared package intent",
+        &inspection.declared_packages,
+    );
+    push_list(
+        &mut out,
+        "Requested package operations",
+        &inspection.requested_package_operations,
+    );
+    push_list(
+        &mut out,
+        "Actual package snapshot changes",
+        &inspection.package_snapshot_changes,
+    );
+    out
+}
+
 fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -260,10 +337,41 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             foreign key (run_id) references runs(id) on delete cascade
         );
 
+        create table if not exists package_snapshots (
+            run_id text not null,
+            phase text not null,
+            backend text not null,
+            package_count integer not null,
+            primary key (run_id, phase, backend),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists package_snapshot_packages (
+            run_id text not null,
+            phase text not null,
+            backend text not null,
+            package text not null,
+            version text,
+            reason text not null,
+            primary key (run_id, phase, backend, package),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists package_snapshot_diff (
+            run_id text not null,
+            backend text not null,
+            package text not null,
+            change text not null,
+            primary key (run_id, backend, package, change),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
         create index if not exists idx_runs_created_at on runs(created_at);
         create index if not exists idx_actions_domain on actions(domain);
         create index if not exists idx_package_operations_package on package_operations(package);
         create index if not exists idx_service_operations_service on service_operations(service);
+        create index if not exists idx_package_snapshot_packages_package on package_snapshot_packages(package);
+        create index if not exists idx_package_snapshot_diff_change on package_snapshot_diff(change);
         ",
     )
     .map_err(|err| format!("failed to migrate state database: {err}"))?;
@@ -332,6 +440,172 @@ fn index_service_operations(conn: &Connection, run_id: &str, path: &Path) -> Res
     Ok(())
 }
 
+fn index_package_snapshot(
+    conn: &Connection,
+    run_id: &str,
+    phase: &str,
+    backend: &str,
+    snapshot: &PackageSnapshot,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into package_snapshots (
+            run_id,
+            phase,
+            backend,
+            package_count
+        ) values (?1, ?2, ?3, ?4)",
+        params![run_id, phase, backend, snapshot.packages.len() as i64],
+    )
+    .map_err(|err| format!("failed to index {backend} package snapshot: {err}"))?;
+
+    for package in snapshot.packages.values() {
+        conn.execute(
+            "insert into package_snapshot_packages (
+                run_id,
+                phase,
+                backend,
+                package,
+                version,
+                reason
+            ) values (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id,
+                phase,
+                backend,
+                package.name,
+                package.version,
+                package.reason.as_str(),
+            ],
+        )
+        .map_err(|err| {
+            format!(
+                "failed to index package snapshot row `{}`: {err}",
+                package.name
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn index_package_snapshot_diff(
+    conn: &Connection,
+    run_id: &str,
+    backend: &str,
+    before: &PackageSnapshot,
+    after: &PackageSnapshot,
+) -> Result<(), String> {
+    let diff = before.diff(after);
+    for package in diff.added {
+        insert_package_snapshot_change(conn, run_id, backend, &package, "added")?;
+    }
+    for package in diff.removed {
+        insert_package_snapshot_change(conn, run_id, backend, &package, "removed")?;
+    }
+    Ok(())
+}
+
+fn insert_package_snapshot_change(
+    conn: &Connection,
+    run_id: &str,
+    backend: &str,
+    package: &str,
+    change: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into package_snapshot_diff (
+            run_id,
+            backend,
+            package,
+            change
+        ) values (?1, ?2, ?3, ?4)",
+        params![run_id, backend, package, change],
+    )
+    .map_err(|err| format!("failed to index package snapshot change `{package}`: {err}"))?;
+    Ok(())
+}
+
+fn latest_run_id(conn: &Connection) -> Result<String, String> {
+    conn.query_row(
+        "select id from runs order by created_at desc, id desc limit 1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("failed to find latest run: {err}"))
+}
+
+fn declared_packages(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    query_strings(
+        conn,
+        "select id from actions where run_id = ?1 and domain = 'packages' order by action_index",
+        run_id,
+    )
+}
+
+fn requested_package_operations(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select backend || ' ' || action || ' ' || package
+            from package_operations
+            where run_id = ?1
+            order by operation_index",
+        )
+        .map_err(|err| format!("failed to prepare package operation inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package operations: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn package_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select backend || ' ' || change || ' ' || package
+            from package_snapshot_diff
+            where run_id = ?1
+            order by backend, change, package",
+        )
+        .map_err(|err| format!("failed to prepare package snapshot inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package snapshot changes: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn query_strings(conn: &Connection, sql: &str, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|err| format!("failed to prepare run inspection query: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect run: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn collect_string_rows(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<String>>,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.map_err(|err| format!("failed to read inspection row: {err}"))?);
+    }
+    Ok(values)
+}
+
+fn push_list(out: &mut String, heading: &str, values: &[String]) {
+    out.push_str(heading);
+    out.push_str(":\n");
+    if values.is_empty() {
+        out.push_str("- none\n\n");
+    } else {
+        for value in values {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +648,12 @@ mod tests {
             package_operations_path: Some(package_log),
             service_operations_path: Some(service_log),
             backup_dir: Some(base.join("backups").join("apply-test")),
+            pacman_snapshot_before: Some(crate::backends::pacman::PackageSnapshot::from_names(
+                std::collections::BTreeSet::from(["old-package".to_string()]),
+            )),
+            pacman_snapshot_after: Some(crate::backends::pacman::PackageSnapshot::from_names(
+                std::collections::BTreeSet::from(["basalt-test".to_string()]),
+            )),
         };
 
         let db_path = index_run(&base, &record, &artifacts).unwrap();
@@ -386,10 +666,31 @@ mod tests {
         assert_eq!(rows[0].package_operation_count, 1);
         assert_eq!(rows[0].service_operation_count, 1);
 
+        let inspection = inspect_run(&base, Some(&record.id)).unwrap();
+        assert_eq!(
+            inspection.declared_packages,
+            vec!["packages.pacman.basalt-test"]
+        );
+        assert_eq!(
+            inspection.requested_package_operations,
+            vec!["pacman ensure-installed basalt-test"]
+        );
+        assert_eq!(
+            inspection.package_snapshot_changes,
+            vec![
+                "pacman added basalt-test".to_string(),
+                "pacman removed old-package".to_string()
+            ]
+        );
+
         let rendered = render_history(&rows);
         assert!(rendered.contains("Basalt run history"));
         assert!(rendered.contains("Packages"));
         assert!(rendered.contains("apply"));
+
+        let inspection_rendered = render_run_inspection(&inspection);
+        assert!(inspection_rendered.contains("Declared package intent"));
+        assert!(inspection_rendered.contains("Actual package snapshot changes"));
 
         let _ = fs::remove_dir_all(base);
     }
