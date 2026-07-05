@@ -14,7 +14,7 @@ pub fn render_diff(config: &BasaltConfig, current: &CurrentState) -> String {
     out.push('\n');
     render_services(config, current, &mut out);
     out.push('\n');
-    render_files(config, &mut out);
+    render_files(config, current, &mut out);
     out
 }
 
@@ -89,24 +89,14 @@ fn render_system(config: &BasaltConfig, current: &CurrentState, out: &mut String
                 &format!("{} (current: {current})", system.hostname),
             );
         }
-        push_status(
+        push_optional_system_status(
             out,
-            "+",
             "timezone",
-            system.timezone.as_deref().unwrap_or("unset"),
+            system.timezone.as_deref(),
+            &current.timezone,
         );
-        push_status(
-            out,
-            "+",
-            "locale",
-            system.locale.as_deref().unwrap_or("unset"),
-        );
-        push_status(
-            out,
-            "+",
-            "keymap",
-            system.keymap.as_deref().unwrap_or("unset"),
-        );
+        push_optional_system_status(out, "locale", system.locale.as_deref(), &current.locale);
+        push_optional_system_status(out, "keymap", system.keymap.as_deref(), &current.keymap);
     } else {
         out.push_str("  none\n");
     }
@@ -133,7 +123,7 @@ fn render_services(config: &BasaltConfig, current: &CurrentState, out: &mut Stri
     }
 }
 
-fn render_files(config: &BasaltConfig, out: &mut String) {
+fn render_files(config: &BasaltConfig, current: &CurrentState, out: &mut String) {
     out.push_str("files:\n");
     if let Some(files) = &config.files {
         if files.managed.is_empty() {
@@ -142,7 +132,14 @@ fn render_files(config: &BasaltConfig, out: &mut String) {
         }
         out.push_str("  managed:\n");
         for file in &files.managed {
-            out.push_str("    + ");
+            let marker = if current.managed_files.get(&file.path) == Some(&file.content) {
+                "="
+            } else {
+                "+"
+            };
+            out.push_str("    ");
+            out.push_str(marker);
+            out.push(' ');
             out.push_str(&file.path);
             if let Some(mode) = &file.mode {
                 out.push_str(" mode=");
@@ -163,6 +160,24 @@ fn push_status(out: &mut String, marker: &str, key: &str, value: &str) {
     out.push_str(": ");
     out.push_str(value);
     out.push('\n');
+}
+
+fn push_optional_system_status(
+    out: &mut String,
+    key: &str,
+    desired: Option<&str>,
+    current: &Option<String>,
+) {
+    let Some(desired) = desired else {
+        push_status(out, "=", key, "unset");
+        return;
+    };
+    let marker = if current.as_deref() == Some(desired) {
+        "="
+    } else {
+        "+"
+    };
+    push_status(out, marker, key, desired);
 }
 
 fn push_list(out: &mut String, key: &str, values: &[String]) {
@@ -322,6 +337,33 @@ mod tests {
         assert!(rendered.contains("= hostname: basalt-vm"));
         assert!(rendered.contains("= git"));
         assert!(rendered.contains("= NetworkManager"));
+    }
+
+    #[test]
+    fn renders_matching_system_and_file_markers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-managed-files");
+        let config = validate_config_dir(&root).unwrap();
+        let current = CurrentState {
+            hostname: Some("basalt-vm".to_string()),
+            timezone: Some("UTC".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            keymap: Some("us".to_string()),
+            managed_files: std::collections::BTreeMap::from([(
+                "/etc/basalt/motd".to_string(),
+                "Basalt managed file\n".to_string(),
+            )]),
+            ..CurrentState::default()
+        };
+
+        let rendered = render_diff(&config, &current);
+        assert!(rendered.contains("= timezone: UTC"));
+        assert!(rendered.contains("= locale: en_US.UTF-8"));
+        assert!(rendered.contains("= keymap: us"));
+        assert!(rendered.contains("= /etc/basalt/motd"));
+        assert!(rendered.contains("= old-example"));
     }
 
     #[test]

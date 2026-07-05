@@ -29,8 +29,11 @@ pub fn run(args: Vec<String>) -> i32 {
                 }
             }
         }
-        Ok(Command::Diff { config_dir }) => match crate::config::validate_config_dir(&config_dir) {
-            Ok(config) => match HostStateReader.read_current_state() {
+        Ok(Command::Diff {
+            config_dir,
+            root_dir,
+        }) => match crate::config::validate_config_dir(&config_dir) {
+            Ok(config) => match read_apply_current_state(&root_dir, &config) {
                 Ok(current) => {
                     print!(
                         "{}",
@@ -319,6 +322,7 @@ enum Command {
     },
     Diff {
         config_dir: PathBuf,
+        root_dir: PathBuf,
     },
     ApplyDryRun {
         config_dir: PathBuf,
@@ -406,8 +410,35 @@ fn parse_validate(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_diff(args: &[String]) -> Result<Command, String> {
-    let config_dir = parse_config_dir_arg(args, "diff")?;
-    Ok(Command::Diff { config_dir })
+    let mut config_dir = None;
+    let mut root_dir = None;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--config` requires a directory path".to_string())?;
+                config_dir = Some(PathBuf::from(value));
+            }
+            "--root" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--root` requires a directory path".to_string())?;
+                root_dir = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::Diff {
+        config_dir: config_dir.ok_or_else(|| "`diff` requires `--config <path>`".to_string())?,
+        root_dir: root_dir.unwrap_or_else(|| PathBuf::from("/")),
+    })
 }
 
 fn parse_apply(args: &[String]) -> Result<Command, String> {
@@ -502,27 +533,6 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
             service_executor,
         })
     }
-}
-
-fn parse_config_dir_arg(args: &[String], command: &str) -> Result<PathBuf, String> {
-    let mut config_dir = None;
-    let mut i = 2;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" => {
-                i += 1;
-                let value = args
-                    .get(i)
-                    .ok_or_else(|| "`--config` requires a directory path".to_string())?;
-                config_dir = Some(PathBuf::from(value));
-            }
-            other => return Err(format!("unexpected argument `{other}`")),
-        }
-        i += 1;
-    }
-
-    config_dir.ok_or_else(|| format!("`{command}` requires `--config <path>`"))
 }
 
 fn parse_history(args: &[String]) -> Result<Command, String> {
@@ -728,7 +738,7 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  basalt validate --config <path>");
-    println!("  basalt diff --config <path>");
+    println!("  basalt diff --config <path> [--root <path>]");
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
     println!("  basalt apply --check --config <path> [--root <path>]");
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record|host] [--service-executor record|host]");
