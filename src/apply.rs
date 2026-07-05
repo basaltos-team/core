@@ -3,7 +3,7 @@
 use crate::backends::aur::resolve_aur_install_transaction;
 use crate::backends::nix::resolve_nix_install_transaction;
 use crate::backends::pacman::{
-    read_installed_package_snapshot, resolve_pacman_install_transaction,
+    preflight_pacman_install, read_installed_package_snapshot, resolve_pacman_install_transaction,
     write_package_operations_log, HostPackageExecutor, PackageBackend, PackageExecutor,
     PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
 };
@@ -338,7 +338,9 @@ fn apply_package_operations(
             write_package_operations_log(state_dir, executor.operations())
         }
         PackageExecutorMode::Host => {
-            let mut executor = HostPackageExecutor::default();
+            let pacman_packages = packages_for_backend(actions, "packages.pacman.");
+            preflight_pacman_install(&pacman_packages)?;
+            let mut executor = HostPackageExecutor::with_preflighted(pacman_packages);
             apply_package_actions(actions, &mut executor)?;
             write_package_operations_log(state_dir, executor.operations())
         }

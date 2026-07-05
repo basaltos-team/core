@@ -83,8 +83,9 @@ pub fn resolve_pacman_install_transaction(
         } else {
             output.stderr.trim()
         };
+        let diagnostic = classify_pacman_resolution_failure(detail);
         return Ok(PackageTransaction::failed(format!(
-            "pacman transaction resolution failed: {detail}"
+            "pacman transaction resolution failed ({diagnostic}): {detail}"
         )));
     }
 
@@ -344,6 +345,13 @@ pub struct HostPackageExecutor {
 }
 
 impl HostPackageExecutor {
+    pub fn with_preflighted(packages: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            operations: Vec::new(),
+            preflighted: packages.into_iter().collect(),
+        }
+    }
+
     pub fn operations(&self) -> &[PackageOperation] {
         &self.operations
     }
@@ -396,6 +404,39 @@ fn install_pacman_package(package: &str) -> Result<(), String> {
         output.stderr.trim()
     };
     Err(format!("pacman failed to install `{package}`: {detail}"))
+}
+
+fn classify_pacman_resolution_failure(detail: &str) -> &'static str {
+    let detail = detail.to_lowercase();
+    if detail.contains("conflicting packages")
+        || detail.contains("conflicts detected")
+        || detail.contains("conflicts with")
+        || detail.contains(" in conflict")
+        || detail.contains("exists in filesystem")
+    {
+        return "package conflict";
+    }
+    if detail.contains("target not found")
+        || detail.contains("could not find")
+        || detail.contains("no package owns")
+    {
+        return "missing package";
+    }
+    if detail.contains("providers are available")
+        || detail.contains("there are ")
+            && detail.contains(" provider")
+            && detail.contains("available")
+    {
+        return "provider selection required";
+    }
+    if detail.contains("breaks dependency")
+        || detail.contains("requires")
+        || detail.contains("replacing")
+        || detail.contains("replace ")
+    {
+        return "unsupported dependency or replacement policy";
+    }
+    "unknown pacman resolver failure"
 }
 
 pub fn write_package_operations_log(
@@ -535,6 +576,28 @@ mod tests {
         assert_eq!(
             transaction.message.as_deref(),
             Some("no pacman packages requested")
+        );
+    }
+
+    #[test]
+    fn classifies_pacman_resolution_failures() {
+        assert_eq!(
+            classify_pacman_resolution_failure(
+                "error: unresolvable package conflicts detected\n:: foo and bar are in conflict"
+            ),
+            "package conflict"
+        );
+        assert_eq!(
+            classify_pacman_resolution_failure("error: target not found: basalt-missing"),
+            "missing package"
+        );
+        assert_eq!(
+            classify_pacman_resolution_failure(":: There are 2 providers available for cron:"),
+            "provider selection required"
+        );
+        assert_eq!(
+            classify_pacman_resolution_failure(":: replacing oldpkg with core/newpkg"),
+            "unsupported dependency or replacement policy"
         );
     }
 }
