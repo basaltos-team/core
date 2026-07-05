@@ -54,6 +54,18 @@ pub struct RunInspection {
     pub package_result_audit: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageHistoryRow {
+    pub run_id: String,
+    pub mode: String,
+    pub created_at: String,
+    pub config_path: PathBuf,
+    pub intent: Vec<String>,
+    pub operations: Vec<String>,
+    pub snapshot_changes: Vec<String>,
+    pub audit: Vec<String>,
+}
+
 pub fn init_state_db(state_dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(state_dir).map_err(|err| format!("{}: {err}", state_dir.display()))?;
     let db_path = state_dir.join(STATE_DB);
@@ -296,6 +308,86 @@ pub fn render_history(rows: &[HistoryRow]) -> String {
             row.created_at,
             row.config_path.display()
         ));
+    }
+    out
+}
+
+pub fn package_history_rows(
+    state_dir: &Path,
+    package: &str,
+    limit: usize,
+) -> Result<Vec<PackageHistoryRow>, String> {
+    let package = package.trim();
+    if package.is_empty() {
+        return Err("package history requires a package name".to_string());
+    }
+
+    let db_path = init_state_db(state_dir)?;
+    let conn = open_connection(&db_path)?;
+    let mut statement = conn
+        .prepare(
+            "select distinct runs.id, runs.mode, runs.created_at, runs.config_path
+            from runs
+            left join package_intent on package_intent.run_id = runs.id
+            left join package_operations on package_operations.run_id = runs.id
+            left join package_snapshot_diff on package_snapshot_diff.run_id = runs.id
+            left join package_transaction_rows on package_transaction_rows.run_id = runs.id
+            where package_intent.package = ?1
+                or package_operations.package = ?1
+                or package_snapshot_diff.package = ?1
+                or package_transaction_rows.package = ?1
+            order by runs.created_at desc, runs.id desc
+            limit ?2",
+        )
+        .map_err(|err| format!("failed to prepare package history query: {err}"))?;
+    let rows = statement
+        .query_map(params![package, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|err| format!("failed to query package history: {err}"))?;
+
+    let mut history = Vec::new();
+    for row in rows {
+        let (run_id, mode, created_at, config_path) =
+            row.map_err(|err| format!("failed to read package history row: {err}"))?;
+        history.push(PackageHistoryRow {
+            intent: package_history_intent(&conn, &run_id, package)?,
+            operations: package_history_operations(&conn, &run_id, package)?,
+            snapshot_changes: package_history_snapshot_changes(&conn, &run_id, package)?,
+            audit: package_history_audit(&conn, &run_id, package)?,
+            run_id,
+            mode,
+            created_at,
+            config_path: PathBuf::from(config_path),
+        });
+    }
+    Ok(history)
+}
+
+pub fn render_package_history(package: &str, rows: &[PackageHistoryRow]) -> String {
+    if rows.is_empty() {
+        return format!("No package history for `{}`.\n", package.trim());
+    }
+
+    let mut out = format!("Basalt package history: {}\n\n", package.trim());
+    for row in rows {
+        out.push_str(&format!(
+            "{} | {} | {} | {}\n",
+            row.run_id,
+            row.mode,
+            row.created_at,
+            row.config_path.display()
+        ));
+        push_indented_list(&mut out, "intent", &row.intent);
+        push_indented_list(&mut out, "operations", &row.operations);
+        push_indented_list(&mut out, "snapshot", &row.snapshot_changes);
+        push_indented_list(&mut out, "audit", &row.audit);
+        out.push('\n');
     }
     out
 }
@@ -943,6 +1035,81 @@ fn package_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, 
     Ok(values)
 }
 
+fn package_history_intent(
+    conn: &Connection,
+    run_id: &str,
+    package: &str,
+) -> Result<Vec<String>, String> {
+    query_package_strings(
+        conn,
+        "select 'packages.' || backend || '.' || package
+        from package_intent
+        where run_id = ?1 and package = ?2
+        order by intent_index",
+        run_id,
+        package,
+    )
+}
+
+fn package_history_operations(
+    conn: &Connection,
+    run_id: &str,
+    package: &str,
+) -> Result<Vec<String>, String> {
+    query_package_strings(
+        conn,
+        "select backend || ' ' || action || ' ' || package
+        from package_operations
+        where run_id = ?1 and package = ?2
+        order by operation_index",
+        run_id,
+        package,
+    )
+}
+
+fn package_history_snapshot_changes(
+    conn: &Connection,
+    run_id: &str,
+    package: &str,
+) -> Result<Vec<String>, String> {
+    let all_changes = package_snapshot_changes(conn, run_id)?;
+    Ok(all_changes
+        .into_iter()
+        .filter(|change| row_mentions_package(change, package))
+        .collect())
+}
+
+fn package_history_audit(
+    conn: &Connection,
+    run_id: &str,
+    package: &str,
+) -> Result<Vec<String>, String> {
+    let all_audit = package_result_audit(conn, run_id)?;
+    Ok(all_audit
+        .into_iter()
+        .filter(|audit| row_mentions_package(audit, package))
+        .collect())
+}
+
+fn row_mentions_package(row: &str, package: &str) -> bool {
+    row.split_whitespace().any(|part| part == package)
+}
+
+fn query_package_strings(
+    conn: &Connection,
+    sql: &str,
+    run_id: &str,
+    package: &str,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|err| format!("failed to prepare package history detail query: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id, package], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package history detail: {err}"))?;
+    collect_string_rows(rows)
+}
+
 fn query_strings(conn: &Connection, sql: &str, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(sql)
@@ -951,6 +1118,21 @@ fn query_strings(conn: &Connection, sql: &str, run_id: &str) -> Result<Vec<Strin
         .query_map(params![run_id], |row| row.get(0))
         .map_err(|err| format!("failed to inspect run: {err}"))?;
     collect_string_rows(rows)
+}
+
+fn push_indented_list(out: &mut String, label: &str, items: &[String]) {
+    out.push_str("  ");
+    out.push_str(label);
+    out.push_str(":\n");
+    if items.is_empty() {
+        out.push_str("    - none\n");
+    } else {
+        for item in items {
+            out.push_str("    - ");
+            out.push_str(item);
+            out.push('\n');
+        }
+    }
 }
 
 fn collect_string_rows(
@@ -1257,6 +1439,72 @@ mod tests {
         assert_eq!(
             inspection.package_result_audit,
             vec!["pacman install tree already satisfied"]
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn package_history_filters_runs_for_one_package() {
+        let base = temp_dir("state-db-package-history-test");
+        fs::create_dir_all(&base).unwrap();
+        let package_log = base.join("package-operations.log");
+        fs::write(&package_log, "pacman ensure-installed tree\n").unwrap();
+
+        let action = Action {
+            id: "packages.pacman.tree".to_string(),
+            domain: "packages".to_string(),
+            description: "ensure pacman package `tree` is installed".to_string(),
+            risk: Risk::High,
+        };
+        let record = RunRecord::apply(
+            PathBuf::from("config"),
+            vec![action],
+            &CurrentState::default(),
+        );
+        let artifacts = StateDbArtifacts {
+            run_json_path: base.join("runs").join(&record.id).join("run.json"),
+            latest_json_path: base.join("latest-run.json"),
+            package_intent: vec![PackageIntent {
+                backend: PackageBackend::Pacman,
+                package: "tree".to_string(),
+            }],
+            package_operations_path: Some(package_log),
+            pacman_snapshot_before: Some(crate::backends::pacman::PackageSnapshot::from_names(
+                std::collections::BTreeSet::new(),
+            )),
+            pacman_snapshot_after: Some(crate::backends::pacman::PackageSnapshot::from_names(
+                std::collections::BTreeSet::from(["tree".to_string()]),
+            )),
+            pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
+                status: PackageResolutionStatus::Resolved,
+                message: None,
+                rows: Vec::new(),
+            }),
+            ..StateDbArtifacts::default()
+        };
+
+        index_run(&base, &record, &artifacts).unwrap();
+
+        let rows = package_history_rows(&base, "tree", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].intent, vec!["packages.pacman.tree"]);
+        assert_eq!(rows[0].operations, vec!["pacman ensure-installed tree"]);
+        assert_eq!(
+            rows[0].snapshot_changes,
+            vec!["pacman added tree [unknown]"]
+        );
+        assert_eq!(rows[0].audit, vec!["pacman install tree observed"]);
+
+        let rendered = render_package_history("tree", &rows);
+        assert!(rendered.contains("Basalt package history: tree"));
+        assert!(rendered.contains("pacman install tree observed"));
+
+        let empty = package_history_rows(&base, "not-present", 10).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            render_package_history("not-present", &empty),
+            "No package history for `not-present`.\n"
         );
 
         let _ = fs::remove_dir_all(base);

@@ -198,6 +198,23 @@ pub fn run(args: Vec<String>) -> i32 {
                 }
             }
         }
+        Ok(Command::PackageHistory {
+            state_dir,
+            package,
+            limit,
+        }) => match crate::state::db::package_history_rows(&state_dir, &package, limit) {
+            Ok(rows) => {
+                print!(
+                    "{}",
+                    crate::state::db::render_package_history(&package, &rows)
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("package-history failed: {err}");
+                1
+            }
+        },
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -276,6 +293,11 @@ enum Command {
         state_dir: PathBuf,
         run_id: Option<String>,
     },
+    PackageHistory {
+        state_dir: PathBuf,
+        package: String,
+        limit: usize,
+    },
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -296,6 +318,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "schema" => Ok(Command::Schema),
         "history" => parse_history(args),
         "inspect-run" => parse_inspect_run(args),
+        "package-history" => parse_package_history(args),
         "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
@@ -500,6 +523,53 @@ fn parse_inspect_run(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_package_history(args: &[String]) -> Result<Command, String> {
+    let mut state_dir = None;
+    let mut package = None;
+    let mut limit = 20usize;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--state-dir` requires a directory path".to_string())?;
+                state_dir = Some(PathBuf::from(value));
+            }
+            "--package" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--package` requires a package name".to_string())?;
+                package = Some(value.to_string());
+            }
+            "--limit" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--limit` requires a positive integer".to_string())?;
+                limit = value
+                    .parse()
+                    .map_err(|_| format!("invalid package history limit `{value}`"))?;
+                if limit == 0 {
+                    return Err("package history limit must be greater than zero".to_string());
+                }
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::PackageHistory {
+        state_dir: state_dir.unwrap_or_else(|| PathBuf::from("./target/basalt-state")),
+        package: package
+            .ok_or_else(|| "`package-history` requires `--package <name>`".to_string())?,
+        limit,
+    })
+}
+
 fn parse_restore(args: &[String]) -> Result<Command, String> {
     let mut backup_dir = None;
     let mut root_dir = None;
@@ -545,6 +615,7 @@ fn print_help() {
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record|host] [--service-executor record|host]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
+    println!("  basalt package-history --package <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }
