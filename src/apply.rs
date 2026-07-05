@@ -41,14 +41,16 @@ pub enum ServiceExecutorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageExecutorMode {
     Record,
+    Host,
 }
 
 impl PackageExecutorMode {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "record" => Ok(Self::Record),
+            "host" => Ok(Self::Host),
             other => Err(format!(
-                "unknown package executor `{other}`; expected `record`"
+                "unknown package executor `{other}`; expected `record` or `host`"
             )),
         }
     }
@@ -118,6 +120,7 @@ pub fn apply_supported_config(
     }
 
     let actions = plan_actions(config, current);
+    validate_package_executor_policy(&actions, root_dir, package_executor)?;
     let unsupported: Vec<&Action> = actions
         .iter()
         .filter(|action| {
@@ -292,9 +295,38 @@ fn apply_package_operations(
 
     match mode {
         PackageExecutorMode::Record => {}
+        PackageExecutorMode::Host => {
+            return Err(
+                "`--package-executor host` is not implemented yet; use `--package-executor record`"
+                    .to_string(),
+            )
+        }
     }
 
     write_package_operations_log(state_dir, executor.operations())
+}
+
+fn validate_package_executor_policy(
+    actions: &[Action],
+    root_dir: &Path,
+    mode: PackageExecutorMode,
+) -> Result<(), String> {
+    if mode == PackageExecutorMode::Record {
+        return Ok(());
+    }
+
+    if !actions.iter().any(|action| action.domain == "packages") {
+        return Ok(());
+    }
+
+    if root_dir != Path::new("/") {
+        return Err("`--package-executor host` requires `--root /`".to_string());
+    }
+
+    Err(
+        "`--package-executor host` is not implemented yet; use `--package-executor record` until pacman/AUR/Nix mutation has Arch VM coverage"
+            .to_string(),
+    )
 }
 
 fn write_with_backup(
@@ -618,6 +650,60 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("requires `--root /`"));
+    }
+
+    #[test]
+    fn host_package_executor_requires_real_root_for_package_actions() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-package-host-root-test-{}",
+            millis_since_epoch()
+        ));
+        let root = base.join("root");
+        let state = base.join("state");
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-package-recording");
+        let config = validate_config_dir(&config_dir).unwrap();
+
+        let err = apply_supported_config(
+            &state,
+            config_dir,
+            &root,
+            &config,
+            &CurrentState::default(),
+            PackageExecutorMode::Host,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("`--package-executor host` requires `--root /`"));
+        assert!(!root.join("etc/hostname").exists());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn host_package_executor_is_guarded_until_real_mutation_exists() {
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-package-recording");
+        let config = validate_config_dir(&config_dir).unwrap();
+
+        let err = apply_supported_config(
+            Path::new("/tmp/basalt-unused-state"),
+            config_dir,
+            Path::new("/"),
+            &config,
+            &CurrentState::default(),
+            PackageExecutorMode::Host,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("not implemented yet"));
+        assert!(err.contains("Arch VM coverage"));
     }
 
     #[test]

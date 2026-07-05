@@ -374,9 +374,9 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
             }
             "--package-executor" => {
                 i += 1;
-                let value = args
-                    .get(i)
-                    .ok_or_else(|| "`--package-executor` requires `record`".to_string())?;
+                let value = args.get(i).ok_or_else(|| {
+                    "`--package-executor` requires `record` or `host`".to_string()
+                })?;
                 package_executor = crate::apply::PackageExecutorMode::parse(value)?;
             }
             other => return Err(format!("unexpected argument `{other}`")),
@@ -542,7 +542,7 @@ fn print_help() {
     println!("  basalt validate --config <path>");
     println!("  basalt diff --config <path>");
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
-    println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record] [--service-executor record|host]");
+    println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record|host] [--service-executor record|host]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
