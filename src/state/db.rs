@@ -44,6 +44,7 @@ pub struct RunInspection {
     pub resolved_package_transactions: Vec<String>,
     pub requested_package_operations: Vec<String>,
     pub package_snapshot_changes: Vec<String>,
+    pub package_result_audit: Vec<String>,
 }
 
 pub fn init_state_db(state_dir: &Path) -> Result<PathBuf, String> {
@@ -283,6 +284,7 @@ pub fn inspect_run(state_dir: &Path, run_id: Option<&str>) -> Result<RunInspecti
         resolved_package_transactions: resolved_package_transactions(&conn, &id)?,
         requested_package_operations: requested_package_operations(&conn, &id)?,
         package_snapshot_changes: package_snapshot_changes(&conn, &id)?,
+        package_result_audit: package_result_audit(&conn, &id)?,
         id,
     })
 }
@@ -315,6 +317,11 @@ pub fn render_run_inspection(inspection: &RunInspection) -> String {
         &mut out,
         "Actual package snapshot changes",
         &inspection.package_snapshot_changes,
+    );
+    push_list(
+        &mut out,
+        "Package result audit",
+        &inspection.package_result_audit,
     );
     out
 }
@@ -742,6 +749,85 @@ fn package_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<Strin
     collect_string_rows(rows)
 }
 
+fn package_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+
+    let mut observed_statement = conn
+        .prepare(
+            "select package_operations.backend || ' install ' ||
+                package_operations.package || ' observed'
+            from package_operations
+            inner join package_snapshot_diff on
+                package_snapshot_diff.run_id = package_operations.run_id
+                and package_snapshot_diff.backend = package_operations.backend
+                and package_snapshot_diff.package = package_operations.package
+                and package_snapshot_diff.change = 'added'
+            where package_operations.run_id = ?1
+                and package_operations.action = 'ensure-installed'
+            order by package_operations.backend, package_operations.package",
+        )
+        .map_err(|err| format!("failed to prepare package result audit: {err}"))?;
+    let observed_rows = observed_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect package result audit: {err}"))?;
+    values.extend(collect_string_rows(observed_rows)?);
+
+    let mut missing_statement = conn
+        .prepare(
+            "select package_operations.backend || ' install ' ||
+                package_operations.package || ' missing from actual snapshot changes'
+            from package_operations
+            where package_operations.run_id = ?1
+                and package_operations.action = 'ensure-installed'
+                and exists (
+                    select 1
+                    from package_snapshots
+                    where package_snapshots.run_id = package_operations.run_id
+                        and package_snapshots.backend = package_operations.backend
+                )
+                and not exists (
+                    select 1
+                    from package_snapshot_diff
+                    where package_snapshot_diff.run_id = package_operations.run_id
+                        and package_snapshot_diff.backend = package_operations.backend
+                        and package_snapshot_diff.package = package_operations.package
+                        and package_snapshot_diff.change = 'added'
+                )
+            order by package_operations.backend, package_operations.package",
+        )
+        .map_err(|err| format!("failed to prepare missing package result audit: {err}"))?;
+    let missing_rows = missing_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect missing package result audit: {err}"))?;
+    values.extend(collect_string_rows(missing_rows)?);
+
+    let mut unexpected_statement = conn
+        .prepare(
+            "select package_snapshot_diff.backend || ' ' ||
+                package_snapshot_diff.change || ' ' ||
+                package_snapshot_diff.package || ' without resolved transaction row'
+            from package_snapshot_diff
+            where package_snapshot_diff.run_id = ?1
+                and not exists (
+                    select 1
+                    from package_operations
+                    where package_operations.run_id = package_snapshot_diff.run_id
+                        and package_operations.backend = package_snapshot_diff.backend
+                        and package_operations.package = package_snapshot_diff.package
+                        and package_snapshot_diff.change = 'added'
+                        and package_operations.action = 'ensure-installed'
+                )
+            order by package_snapshot_diff.backend, package_snapshot_diff.change, package_snapshot_diff.package",
+        )
+        .map_err(|err| format!("failed to prepare unexpected package result audit: {err}"))?;
+    let unexpected_rows = unexpected_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect unexpected package result audit: {err}"))?;
+    values.extend(collect_string_rows(unexpected_rows)?);
+
+    Ok(values)
+}
+
 fn query_strings(conn: &Connection, sql: &str, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(sql)
@@ -932,6 +1018,13 @@ mod tests {
                 "pacman removed old-package [unknown]".to_string()
             ]
         );
+        assert_eq!(
+            inspection.package_result_audit,
+            vec![
+                "pacman install basalt-test observed".to_string(),
+                "pacman removed old-package without resolved transaction row".to_string()
+            ]
+        );
 
         let rendered = render_history(&rows);
         assert!(rendered.contains("Basalt run history"));
@@ -943,6 +1036,7 @@ mod tests {
         assert!(inspection_rendered.contains("Package transaction resolution"));
         assert!(inspection_rendered.contains("Resolved package transactions"));
         assert!(inspection_rendered.contains("Actual package snapshot changes"));
+        assert!(inspection_rendered.contains("Package result audit"));
 
         let _ = fs::remove_dir_all(base);
     }
