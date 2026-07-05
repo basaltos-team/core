@@ -305,4 +305,17 @@ mod tests {
                 && (err.contains("os") || err.contains("nil value"))
         }));
     }
+
+    #[test]
+    fn rejects_shared_package_version_constraint_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/invalid-package-version-constraint");
+
+        let errors = validate_config_dir(&root).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|err| err.contains("unsupported version constraint syntax")));
+    }
 }

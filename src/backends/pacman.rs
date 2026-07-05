@@ -95,6 +95,21 @@ pub fn resolve_pacman_install_transaction(
     })
 }
 
+pub fn preflight_pacman_install(packages: &[String]) -> Result<PackageTransaction, String> {
+    let transaction = resolve_pacman_install_transaction(packages)?;
+    match transaction.status {
+        PackageResolutionStatus::Resolved => Ok(transaction),
+        PackageResolutionStatus::Skipped => Ok(transaction),
+        PackageResolutionStatus::Unavailable | PackageResolutionStatus::Failed => {
+            let message = transaction
+                .message
+                .clone()
+                .unwrap_or_else(|| "pacman transaction preflight failed".to_string());
+            Err(message)
+        }
+    }
+}
+
 fn read_explicit_package_names() -> BTreeSet<String> {
     let Ok(output) = run_capture("pacman", &["-Qqe"]) else {
         return BTreeSet::new();
@@ -325,6 +340,7 @@ impl PackageExecutor for RecordingPackageExecutor {
 #[derive(Debug, Default)]
 pub struct HostPackageExecutor {
     operations: Vec<PackageOperation>,
+    preflighted: BTreeSet<String>,
 }
 
 impl HostPackageExecutor {
@@ -337,6 +353,14 @@ impl PackageExecutor for HostPackageExecutor {
     fn ensure_installed(&mut self, backend: PackageBackend, package: &str) -> Result<(), String> {
         match backend {
             PackageBackend::Pacman => {
+                let package = package.trim();
+                if package.is_empty() {
+                    return Ok(());
+                }
+                if !self.preflighted.contains(package) {
+                    preflight_pacman_install(&[package.to_string()])?;
+                    self.preflighted.insert(package.to_string());
+                }
                 install_pacman_package(package)?;
                 self.operations.push(PackageOperation {
                     backend,
@@ -501,5 +525,16 @@ mod tests {
 
         assert_eq!(transaction.status, PackageResolutionStatus::Skipped);
         assert!(transaction.message.unwrap().contains("no transaction"));
+    }
+
+    #[test]
+    fn pacman_preflight_skips_empty_package_sets() {
+        let transaction = preflight_pacman_install(&[]).unwrap();
+
+        assert_eq!(transaction.status, PackageResolutionStatus::Skipped);
+        assert_eq!(
+            transaction.message.as_deref(),
+            Some("no pacman packages requested")
+        );
     }
 }
