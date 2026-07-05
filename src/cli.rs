@@ -215,6 +215,23 @@ pub fn run(args: Vec<String>) -> i32 {
                 1
             }
         },
+        Ok(Command::ServiceHistory {
+            state_dir,
+            service,
+            limit,
+        }) => match crate::state::db::service_history_rows(&state_dir, &service, limit) {
+            Ok(rows) => {
+                print!(
+                    "{}",
+                    crate::state::db::render_service_history(&service, &rows)
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("service-history failed: {err}");
+                1
+            }
+        },
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -298,6 +315,11 @@ enum Command {
         package: String,
         limit: usize,
     },
+    ServiceHistory {
+        state_dir: PathBuf,
+        service: String,
+        limit: usize,
+    },
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -319,6 +341,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "history" => parse_history(args),
         "inspect-run" => parse_inspect_run(args),
         "package-history" => parse_package_history(args),
+        "service-history" => parse_service_history(args),
         "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
@@ -570,6 +593,53 @@ fn parse_package_history(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_service_history(args: &[String]) -> Result<Command, String> {
+    let mut state_dir = None;
+    let mut service = None;
+    let mut limit = 20usize;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--state-dir` requires a directory path".to_string())?;
+                state_dir = Some(PathBuf::from(value));
+            }
+            "--service" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--service` requires a service name".to_string())?;
+                service = Some(value.to_string());
+            }
+            "--limit" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--limit` requires a positive integer".to_string())?;
+                limit = value
+                    .parse()
+                    .map_err(|_| format!("invalid service history limit `{value}`"))?;
+                if limit == 0 {
+                    return Err("service history limit must be greater than zero".to_string());
+                }
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::ServiceHistory {
+        state_dir: state_dir.unwrap_or_else(|| PathBuf::from("./target/basalt-state")),
+        service: service
+            .ok_or_else(|| "`service-history` requires `--service <name>`".to_string())?,
+        limit,
+    })
+}
+
 fn parse_restore(args: &[String]) -> Result<Command, String> {
     let mut backup_dir = None;
     let mut root_dir = None;
@@ -616,6 +686,7 @@ fn print_help() {
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
     println!("  basalt package-history --package <name> [--state-dir <path>] [--limit <n>]");
+    println!("  basalt service-history --service <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }

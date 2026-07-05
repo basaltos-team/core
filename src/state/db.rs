@@ -80,6 +80,18 @@ pub struct PackageHistoryRow {
     pub audit: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceHistoryRow {
+    pub run_id: String,
+    pub mode: String,
+    pub created_at: String,
+    pub config_path: PathBuf,
+    pub intent: Vec<String>,
+    pub operations: Vec<String>,
+    pub snapshot_changes: Vec<String>,
+    pub audit: Vec<String>,
+}
+
 pub fn init_state_db(state_dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(state_dir).map_err(|err| format!("{}: {err}", state_dir.display()))?;
     let db_path = state_dir.join(STATE_DB);
@@ -435,6 +447,87 @@ pub fn render_package_history(package: &str, rows: &[PackageHistoryRow]) -> Stri
     }
 
     let mut out = format!("Basalt package history: {}\n\n", package.trim());
+    for row in rows {
+        out.push_str(&format!(
+            "{} | {} | {} | {}\n",
+            row.run_id,
+            row.mode,
+            row.created_at,
+            row.config_path.display()
+        ));
+        push_indented_list(&mut out, "intent", &row.intent);
+        push_indented_list(&mut out, "operations", &row.operations);
+        push_indented_list(&mut out, "snapshot", &row.snapshot_changes);
+        push_indented_list(&mut out, "audit", &row.audit);
+        out.push('\n');
+    }
+    out
+}
+
+pub fn service_history_rows(
+    state_dir: &Path,
+    service: &str,
+    limit: usize,
+) -> Result<Vec<ServiceHistoryRow>, String> {
+    let service = service.trim();
+    if service.is_empty() {
+        return Err("service history requires a service name".to_string());
+    }
+    let service_unit = service_unit_alias(service);
+
+    let db_path = init_state_db(state_dir)?;
+    let conn = open_connection(&db_path)?;
+    let mut statement = conn
+        .prepare(
+            "select distinct runs.id, runs.mode, runs.created_at, runs.config_path
+            from runs
+            left join service_intent on service_intent.run_id = runs.id
+            left join service_operations on service_operations.run_id = runs.id
+            left join service_snapshot_diff on service_snapshot_diff.run_id = runs.id
+            left join service_snapshot_services on service_snapshot_services.run_id = runs.id
+            where service_intent.service in (?1, ?2)
+                or service_operations.service in (?1, ?2)
+                or service_snapshot_diff.service in (?1, ?2)
+                or service_snapshot_services.service in (?1, ?2)
+            order by runs.created_at desc, runs.id desc
+            limit ?3",
+        )
+        .map_err(|err| format!("failed to prepare service history query: {err}"))?;
+    let rows = statement
+        .query_map(params![service, service_unit, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|err| format!("failed to query service history: {err}"))?;
+
+    let mut history = Vec::new();
+    for row in rows {
+        let (run_id, mode, created_at, config_path) =
+            row.map_err(|err| format!("failed to read service history row: {err}"))?;
+        history.push(ServiceHistoryRow {
+            intent: service_history_intent(&conn, &run_id, service, &service_unit)?,
+            operations: service_history_operations(&conn, &run_id, service, &service_unit)?,
+            snapshot_changes: service_history_snapshot_changes(&conn, &run_id, service)?,
+            audit: service_history_audit(&conn, &run_id, service)?,
+            run_id,
+            mode,
+            created_at,
+            config_path: PathBuf::from(config_path),
+        });
+    }
+    Ok(history)
+}
+
+pub fn render_service_history(service: &str, rows: &[ServiceHistoryRow]) -> String {
+    if rows.is_empty() {
+        return format!("No service history for `{}`.\n", service.trim());
+    }
+
+    let mut out = format!("Basalt service history: {}\n\n", service.trim());
     for row in rows {
         out.push_str(&format!(
             "{} | {} | {} | {}\n",
@@ -1533,8 +1626,83 @@ fn package_history_audit(
         .collect())
 }
 
+fn service_history_intent(
+    conn: &Connection,
+    run_id: &str,
+    service: &str,
+    service_unit: &str,
+) -> Result<Vec<String>, String> {
+    query_service_strings(
+        conn,
+        "select 'services.' || action || '.' || service
+        from service_intent
+        where run_id = ?1 and service in (?2, ?3)
+        order by intent_index",
+        run_id,
+        service,
+        service_unit,
+    )
+}
+
+fn service_history_operations(
+    conn: &Connection,
+    run_id: &str,
+    service: &str,
+    service_unit: &str,
+) -> Result<Vec<String>, String> {
+    query_service_strings(
+        conn,
+        "select action || ' ' || service
+        from service_operations
+        where run_id = ?1 and service in (?2, ?3)
+        order by operation_index",
+        run_id,
+        service,
+        service_unit,
+    )
+}
+
+fn service_history_snapshot_changes(
+    conn: &Connection,
+    run_id: &str,
+    service: &str,
+) -> Result<Vec<String>, String> {
+    let all_changes = service_snapshot_changes(conn, run_id)?;
+    Ok(all_changes
+        .into_iter()
+        .filter(|change| row_mentions_service(change, service))
+        .collect())
+}
+
+fn service_history_audit(
+    conn: &Connection,
+    run_id: &str,
+    service: &str,
+) -> Result<Vec<String>, String> {
+    let all_audit = service_result_audit(conn, run_id)?;
+    Ok(all_audit
+        .into_iter()
+        .filter(|audit| row_mentions_service(audit, service))
+        .collect())
+}
+
 fn row_mentions_package(row: &str, package: &str) -> bool {
     row.split_whitespace().any(|part| part == package)
+}
+
+fn row_mentions_service(row: &str, service: &str) -> bool {
+    let service = service.trim();
+    let service_unit = service_unit_alias(service);
+    row.split_whitespace()
+        .any(|part| part == service || part == service_unit)
+}
+
+fn service_unit_alias(service: &str) -> String {
+    if service.ends_with(".service") {
+        service.to_string()
+    } else {
+        format!("{service}.service")
+    }
 }
 
 fn query_package_strings(
@@ -1549,6 +1717,22 @@ fn query_package_strings(
     let rows = statement
         .query_map(params![run_id, package], |row| row.get(0))
         .map_err(|err| format!("failed to inspect package history detail: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn query_service_strings(
+    conn: &Connection,
+    sql: &str,
+    run_id: &str,
+    service: &str,
+    service_unit: &str,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|err| format!("failed to prepare service history detail query: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id, service, service_unit], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect service history detail: {err}"))?;
     collect_string_rows(rows)
 }
 
@@ -2013,6 +2197,69 @@ mod tests {
         assert_eq!(
             render_package_history("not-present", &empty),
             "No package history for `not-present`.\n"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn service_history_filters_runs_for_one_service() {
+        let base = temp_dir("state-db-service-history-test");
+        fs::create_dir_all(&base).unwrap();
+        let service_log = base.join("service-operations.log");
+        fs::write(&service_log, "enable basalt-example.service\n").unwrap();
+
+        let action = Action {
+            id: "services.enable.basalt-example.service".to_string(),
+            domain: "services".to_string(),
+            description: "enable service `basalt-example.service`".to_string(),
+            risk: Risk::High,
+        };
+        let record = RunRecord::apply(
+            PathBuf::from("config"),
+            vec![action],
+            &CurrentState::default(),
+        );
+        let artifacts = StateDbArtifacts {
+            run_json_path: base.join("runs").join(&record.id).join("run.json"),
+            latest_json_path: base.join("latest-run.json"),
+            service_intent: vec![ServiceIntent {
+                action: "enable".to_string(),
+                service: "basalt-example.service".to_string(),
+            }],
+            service_operations_path: Some(service_log),
+            enabled_services_before: Some(BTreeSet::new()),
+            enabled_services_after: Some(BTreeSet::from(["basalt-example.service".to_string()])),
+            ..StateDbArtifacts::default()
+        };
+
+        index_run(&base, &record, &artifacts).unwrap();
+
+        let rows = service_history_rows(&base, "basalt-example", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].intent,
+            vec!["services.enable.basalt-example.service"]
+        );
+        assert_eq!(rows[0].operations, vec!["enable basalt-example.service"]);
+        assert_eq!(
+            rows[0].snapshot_changes,
+            vec!["enabled basalt-example.service"]
+        );
+        assert_eq!(
+            rows[0].audit,
+            vec!["enable basalt-example.service observed"]
+        );
+
+        let rendered = render_service_history("basalt-example", &rows);
+        assert!(rendered.contains("Basalt service history: basalt-example"));
+        assert!(rendered.contains("enable basalt-example.service observed"));
+
+        let empty = service_history_rows(&base, "not-present", 10).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            render_service_history("not-present", &empty),
+            "No service history for `not-present`.\n"
         );
 
         let _ = fs::remove_dir_all(base);
