@@ -47,6 +47,34 @@ pub fn render_dry_run(actions: &[Action]) -> String {
     out
 }
 
+pub fn render_check(actions: &[Action]) -> String {
+    let mut out = String::new();
+    out.push_str("Basalt apply check\n\n");
+
+    if actions.is_empty() {
+        out.push_str("No changes needed.\n");
+        return out;
+    }
+
+    out.push_str("Pending action(s):\n");
+    for action in actions {
+        out.push_str("  - id: ");
+        out.push_str(&action.id);
+        out.push('\n');
+        out.push_str("    domain: ");
+        out.push_str(&action.domain);
+        out.push('\n');
+        out.push_str("    risk: ");
+        out.push_str(action.risk.as_str());
+        out.push('\n');
+        out.push_str("    plan: ");
+        out.push_str(&action.description);
+        out.push('\n');
+    }
+
+    out
+}
+
 fn render_system(config: &BasaltConfig, current: &CurrentState, out: &mut String) {
     out.push_str("system:\n");
     if let Some(system) = &config.system {
@@ -225,6 +253,24 @@ mod tests {
         assert!(rendered.contains("hostname: basalt-vm"));
         assert!(rendered.contains("+ base-devel"));
         assert!(rendered.contains("+ NetworkManager"));
+    }
+
+    #[test]
+    fn renders_apply_check_status() {
+        let action = Action {
+            id: "system.hostname".to_string(),
+            domain: "system".to_string(),
+            description: "set hostname to `basalt-vm`".to_string(),
+            risk: crate::planning::action::Risk::Medium,
+        };
+
+        let pending = render_check(&[action]);
+        assert!(pending.contains("Basalt apply check"));
+        assert!(pending.contains("Pending action(s)"));
+        assert!(pending.contains("system.hostname"));
+
+        let settled = render_check(&[]);
+        assert!(settled.contains("No changes needed."));
     }
 
     #[test]

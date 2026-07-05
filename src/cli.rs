@@ -98,6 +98,33 @@ pub fn run(args: Vec<String>) -> i32 {
                 1
             }
         },
+        Ok(Command::ApplyCheck {
+            config_dir,
+            root_dir,
+        }) => match crate::config::validate_config_dir(&config_dir) {
+            Ok(config) => match read_apply_current_state(&root_dir, &config) {
+                Ok(current) => {
+                    let actions = crate::apply::dry_run_actions(&config, &current);
+                    print!("{}", crate::planning::report::render_check(&actions));
+                    if actions.is_empty() {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                Err(err) => {
+                    eprintln!("failed to read current state: {err}");
+                    1
+                }
+            },
+            Err(errs) => {
+                eprintln!("Basalt config invalid:");
+                for err in errs {
+                    eprintln!("- {err}");
+                }
+                1
+            }
+        },
         Ok(Command::Apply {
             config_dir,
             state_dir,
@@ -297,6 +324,10 @@ enum Command {
         config_dir: PathBuf,
         state_dir: PathBuf,
     },
+    ApplyCheck {
+        config_dir: PathBuf,
+        root_dir: PathBuf,
+    },
     Apply {
         config_dir: PathBuf,
         state_dir: PathBuf,
@@ -381,6 +412,7 @@ fn parse_diff(args: &[String]) -> Result<Command, String> {
 
 fn parse_apply(args: &[String]) -> Result<Command, String> {
     let mut dry_run = false;
+    let mut check = false;
     let mut yes = false;
     let mut config_dir = None;
     let mut state_dir = None;
@@ -392,6 +424,7 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--dry-run" => dry_run = true,
+            "--check" => check = true,
             "--yes" => yes = true,
             "--config" => {
                 i += 1;
@@ -433,12 +466,19 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
-    if dry_run && yes {
-        return Err("use either `apply --dry-run` or `apply --yes`, not both".to_string());
+    if [dry_run, check, yes]
+        .iter()
+        .filter(|enabled| **enabled)
+        .count()
+        > 1
+    {
+        return Err(
+            "use only one of `apply --dry-run`, `apply --check`, or `apply --yes`".to_string(),
+        );
     }
 
-    if !dry_run && !yes {
-        return Err("real apply requires `--yes`; use `--dry-run` to preview".to_string());
+    if !dry_run && !check && !yes {
+        return Err("apply requires `--dry-run`, `--check`, or `--yes`".to_string());
     }
 
     let config_dir = config_dir.ok_or_else(|| "`apply` requires `--config <path>`".to_string())?;
@@ -447,6 +487,11 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
         Ok(Command::ApplyDryRun {
             config_dir,
             state_dir,
+        })
+    } else if check {
+        Ok(Command::ApplyCheck {
+            config_dir,
+            root_dir: root_dir.unwrap_or_else(|| PathBuf::from("/")),
         })
     } else {
         Ok(Command::Apply {
@@ -685,6 +730,7 @@ fn print_help() {
     println!("  basalt validate --config <path>");
     println!("  basalt diff --config <path>");
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
+    println!("  basalt apply --check --config <path> [--root <path>]");
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record|host] [--service-executor record|host]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
