@@ -9,12 +9,13 @@ use crate::backends::pacman::{PackageBackend, PackageSnapshot, PackageTransactio
 use crate::state::store::RunRecord;
 
 const STATE_DB: &str = "state.db";
-const MIGRATION_VERSION: i64 = 4;
+const MIGRATION_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct StateDbArtifacts {
     pub run_json_path: PathBuf,
     pub latest_json_path: PathBuf,
+    pub package_intent: Vec<PackageIntent>,
     pub package_operations_path: Option<PathBuf>,
     pub service_operations_path: Option<PathBuf>,
     pub backup_dir: Option<PathBuf>,
@@ -23,6 +24,12 @@ pub struct StateDbArtifacts {
     pub pacman_transaction: Option<PackageTransaction>,
     pub aur_transaction: Option<PackageTransaction>,
     pub nix_transaction: Option<PackageTransaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIntent {
+    pub backend: PackageBackend,
+    pub package: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +138,29 @@ pub fn index_run(
             ],
         )
         .map_err(|err| format!("failed to index action {}: {err}", action.id))?;
+    }
+
+    tx.execute(
+        "delete from package_intent where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed package intent: {err}"))?;
+    for (index, intent) in artifacts.package_intent.iter().enumerate() {
+        tx.execute(
+            "insert into package_intent (
+                run_id,
+                intent_index,
+                backend,
+                package
+            ) values (?1, ?2, ?3, ?4)",
+            params![
+                record.id,
+                index as i64,
+                intent.backend.as_str(),
+                intent.package,
+            ],
+        )
+        .map_err(|err| format!("failed to index package intent `{}`: {err}", intent.package))?;
     }
 
     tx.execute(
@@ -372,6 +402,15 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             foreign key (run_id) references runs(id) on delete cascade
         );
 
+        create table if not exists package_intent (
+            run_id text not null,
+            intent_index integer not null,
+            backend text not null,
+            package text not null,
+            primary key (run_id, intent_index),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
         create table if not exists service_operations (
             run_id text not null,
             operation_index integer not null,
@@ -434,6 +473,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
 
         create index if not exists idx_runs_created_at on runs(created_at);
         create index if not exists idx_actions_domain on actions(domain);
+        create index if not exists idx_package_intent_package on package_intent(package);
         create index if not exists idx_package_operations_package on package_operations(package);
         create index if not exists idx_service_operations_service on service_operations(service);
         create index if not exists idx_package_snapshot_packages_package on package_snapshot_packages(package);
@@ -666,7 +706,10 @@ fn latest_run_id(conn: &Connection) -> Result<String, String> {
 fn declared_packages(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
     query_strings(
         conn,
-        "select id from actions where run_id = ?1 and domain = 'packages' order by action_index",
+        "select 'packages.' || backend || '.' || package
+        from package_intent
+        where run_id = ?1
+        order by intent_index",
         run_id,
     )
 }
@@ -772,6 +815,70 @@ fn package_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, 
         .map_err(|err| format!("failed to inspect package result audit: {err}"))?;
     values.extend(collect_string_rows(observed_rows)?);
 
+    let mut intent_satisfied_statement = conn
+        .prepare(
+            "select package_intent.backend || ' install ' ||
+                package_intent.package || ' already satisfied'
+            from package_intent
+            inner join package_snapshot_packages before_snapshot on
+                before_snapshot.run_id = package_intent.run_id
+                and before_snapshot.backend = package_intent.backend
+                and before_snapshot.package = package_intent.package
+                and before_snapshot.phase = 'before'
+            inner join package_snapshot_packages after_snapshot on
+                after_snapshot.run_id = package_intent.run_id
+                and after_snapshot.backend = package_intent.backend
+                and after_snapshot.package = package_intent.package
+                and after_snapshot.phase = 'after'
+            where package_intent.run_id = ?1
+                and not exists (
+                    select 1
+                    from package_operations
+                    where package_operations.run_id = package_intent.run_id
+                        and package_operations.backend = package_intent.backend
+                        and package_operations.package = package_intent.package
+                )
+            order by package_intent.backend, package_intent.package",
+        )
+        .map_err(|err| format!("failed to prepare intent package result audit: {err}"))?;
+    let intent_satisfied_rows = intent_satisfied_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect intent package result audit: {err}"))?;
+    values.extend(collect_string_rows(intent_satisfied_rows)?);
+
+    let mut satisfied_statement = conn
+        .prepare(
+            "select package_operations.backend || ' install ' ||
+                package_operations.package || ' already satisfied'
+            from package_operations
+            inner join package_snapshot_packages before_snapshot on
+                before_snapshot.run_id = package_operations.run_id
+                and before_snapshot.backend = package_operations.backend
+                and before_snapshot.package = package_operations.package
+                and before_snapshot.phase = 'before'
+            inner join package_snapshot_packages after_snapshot on
+                after_snapshot.run_id = package_operations.run_id
+                and after_snapshot.backend = package_operations.backend
+                and after_snapshot.package = package_operations.package
+                and after_snapshot.phase = 'after'
+            where package_operations.run_id = ?1
+                and package_operations.action = 'ensure-installed'
+                and not exists (
+                    select 1
+                    from package_snapshot_diff
+                    where package_snapshot_diff.run_id = package_operations.run_id
+                        and package_snapshot_diff.backend = package_operations.backend
+                        and package_snapshot_diff.package = package_operations.package
+                        and package_snapshot_diff.change = 'added'
+                )
+            order by package_operations.backend, package_operations.package",
+        )
+        .map_err(|err| format!("failed to prepare satisfied package result audit: {err}"))?;
+    let satisfied_rows = satisfied_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect satisfied package result audit: {err}"))?;
+    values.extend(collect_string_rows(satisfied_rows)?);
+
     let mut missing_statement = conn
         .prepare(
             "select package_operations.backend || ' install ' ||
@@ -792,6 +899,14 @@ fn package_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, 
                         and package_snapshot_diff.backend = package_operations.backend
                         and package_snapshot_diff.package = package_operations.package
                         and package_snapshot_diff.change = 'added'
+                )
+                and not exists (
+                    select 1
+                    from package_snapshot_packages
+                    where package_snapshot_packages.run_id = package_operations.run_id
+                        and package_snapshot_packages.backend = package_operations.backend
+                        and package_snapshot_packages.package = package_operations.package
+                        and package_snapshot_packages.phase = 'after'
                 )
             order by package_operations.backend, package_operations.package",
         )
@@ -945,6 +1060,20 @@ mod tests {
         let artifacts = StateDbArtifacts {
             run_json_path: base.join("runs").join(&record.id).join("run.json"),
             latest_json_path: base.join("latest-run.json"),
+            package_intent: vec![
+                PackageIntent {
+                    backend: PackageBackend::Pacman,
+                    package: "basalt-test".to_string(),
+                },
+                PackageIntent {
+                    backend: PackageBackend::Aur,
+                    package: "yay-bin".to_string(),
+                },
+                PackageIntent {
+                    backend: PackageBackend::Nix,
+                    package: "hello".to_string(),
+                },
+            ],
             package_operations_path: Some(package_log),
             service_operations_path: Some(service_log),
             backup_dir: Some(base.join("backups").join("apply-test")),
@@ -1037,6 +1166,98 @@ mod tests {
         assert!(inspection_rendered.contains("Resolved package transactions"));
         assert!(inspection_rendered.contains("Actual package snapshot changes"));
         assert!(inspection_rendered.contains("Package result audit"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn package_result_audit_marks_already_satisfied_installs() {
+        let base = temp_dir("state-db-satisfied-test");
+        fs::create_dir_all(&base).unwrap();
+        let package_log = base.join("package-operations.log");
+        fs::write(&package_log, "pacman ensure-installed git\n").unwrap();
+
+        let action = Action {
+            id: "packages.pacman.git".to_string(),
+            domain: "packages".to_string(),
+            description: "ensure pacman package `git` is installed".to_string(),
+            risk: Risk::High,
+        };
+        let record = RunRecord::apply(
+            PathBuf::from("config"),
+            vec![action],
+            &CurrentState::default(),
+        );
+        let snapshot = crate::backends::pacman::PackageSnapshot::from_names(
+            std::collections::BTreeSet::from(["git".to_string()]),
+        );
+        let artifacts = StateDbArtifacts {
+            run_json_path: base.join("runs").join(&record.id).join("run.json"),
+            latest_json_path: base.join("latest-run.json"),
+            package_intent: vec![PackageIntent {
+                backend: PackageBackend::Pacman,
+                package: "git".to_string(),
+            }],
+            package_operations_path: Some(package_log),
+            pacman_snapshot_before: Some(snapshot.clone()),
+            pacman_snapshot_after: Some(snapshot),
+            pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
+                status: PackageResolutionStatus::Resolved,
+                message: None,
+                rows: Vec::new(),
+            }),
+            ..StateDbArtifacts::default()
+        };
+
+        index_run(&base, &record, &artifacts).unwrap();
+
+        let inspection = inspect_run(&base, Some(&record.id)).unwrap();
+        assert_eq!(
+            inspection.package_result_audit,
+            vec!["pacman install git already satisfied"]
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn package_result_audit_marks_declared_intent_satisfied_without_operation() {
+        let base = temp_dir("state-db-intent-satisfied-test");
+        fs::create_dir_all(&base).unwrap();
+
+        let record = RunRecord::apply(
+            PathBuf::from("config"),
+            Vec::new(),
+            &CurrentState::default(),
+        );
+        let snapshot = crate::backends::pacman::PackageSnapshot::from_names(
+            std::collections::BTreeSet::from(["tree".to_string()]),
+        );
+        let artifacts = StateDbArtifacts {
+            run_json_path: base.join("runs").join(&record.id).join("run.json"),
+            latest_json_path: base.join("latest-run.json"),
+            package_intent: vec![PackageIntent {
+                backend: PackageBackend::Pacman,
+                package: "tree".to_string(),
+            }],
+            pacman_snapshot_before: Some(snapshot.clone()),
+            pacman_snapshot_after: Some(snapshot),
+            pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
+                status: PackageResolutionStatus::Resolved,
+                message: None,
+                rows: Vec::new(),
+            }),
+            ..StateDbArtifacts::default()
+        };
+
+        index_run(&base, &record, &artifacts).unwrap();
+
+        let inspection = inspect_run(&base, Some(&record.id)).unwrap();
+        assert_eq!(inspection.declared_packages, vec!["packages.pacman.tree"]);
+        assert_eq!(
+            inspection.package_result_audit,
+            vec!["pacman install tree already satisfied"]
+        );
 
         let _ = fs::remove_dir_all(base);
     }

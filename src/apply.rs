@@ -9,7 +9,7 @@ use crate::backends::pacman::{
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
-use crate::state::db::{index_run, StateDbArtifacts};
+use crate::state::db::{index_run, PackageIntent, StateDbArtifacts};
 use crate::state::store::{write_run_record, CurrentState, RunRecord, StateLock};
 use crate::system::services::{
     write_service_operations_log, HostServiceExecutor, RecordingServiceExecutor, ServiceExecutor,
@@ -76,6 +76,7 @@ pub fn dry_run_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Act
 pub fn write_dry_run_record(
     state_dir: &Path,
     config_dir: PathBuf,
+    config: &BasaltConfig,
     actions: Vec<Action>,
     current: &CurrentState,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
@@ -88,6 +89,7 @@ pub fn write_dry_run_record(
         &StateDbArtifacts {
             run_json_path: run_path.clone(),
             latest_json_path: latest_path.clone(),
+            package_intent: package_intent_from_config(config),
             pacman_snapshot_before: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
@@ -225,6 +227,7 @@ pub fn apply_supported_config(
         &StateDbArtifacts {
             run_json_path: run_path.clone(),
             latest_json_path: latest_path.clone(),
+            package_intent: package_intent_from_config(config),
             package_operations_path: package_operations_path.clone(),
             service_operations_path: service_operations_path.clone(),
             backup_dir: Some(backup_dir.clone()),
@@ -249,6 +252,25 @@ pub fn apply_supported_config(
         run_path,
         latest_path,
     })
+}
+
+fn package_intent_from_config(config: &BasaltConfig) -> Vec<PackageIntent> {
+    let mut intent = Vec::new();
+    if let Some(packages) = &config.packages {
+        intent.extend(packages.pacman.iter().map(|package| PackageIntent {
+            backend: PackageBackend::Pacman,
+            package: package.to_string(),
+        }));
+        intent.extend(packages.aur.iter().map(|package| PackageIntent {
+            backend: PackageBackend::Aur,
+            package: package.to_string(),
+        }));
+        intent.extend(packages.nix.iter().map(|package| PackageIntent {
+            backend: PackageBackend::Nix,
+            package: package.to_string(),
+        }));
+    }
+    intent
 }
 
 struct PackageTransactions {

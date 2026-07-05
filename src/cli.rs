@@ -64,7 +64,7 @@ pub fn run(args: Vec<String>) -> i32 {
                     let actions = crate::apply::dry_run_actions(&config, &current);
                     print!("{}", crate::planning::report::render_dry_run(&actions));
                     match crate::apply::write_dry_run_record(
-                        &state_dir, config_dir, actions, &current,
+                        &state_dir, config_dir, &config, actions, &current,
                     ) {
                         Ok((run_path, latest_path)) => {
                             println!();
