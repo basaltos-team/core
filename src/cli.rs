@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use crate::state::store::{CurrentState, HostStateReader, StateReader, TargetRootStateReader};
+use crate::state::store::{
+    read_configured_managed_files, CurrentState, HostStateReader, StateReader,
+    TargetRootStateReader,
+};
 
 pub fn run(args: Vec<String>) -> i32 {
     match parse_args(&args) {
@@ -696,7 +699,9 @@ fn read_apply_current_state(
     config: &crate::config::BasaltConfig,
 ) -> Result<CurrentState, String> {
     if root_dir == std::path::Path::new("/") {
-        HostStateReader.read_current_state()
+        let mut current = HostStateReader.read_current_state()?;
+        current.managed_files = read_configured_managed_files(root_dir, config);
+        Ok(current)
     } else {
         TargetRootStateReader::new(root_dir, config).read_current_state()
     }

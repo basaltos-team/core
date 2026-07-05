@@ -111,7 +111,7 @@ impl StateReader for TargetRootStateReader<'_> {
     }
 }
 
-fn read_configured_managed_files(
+pub fn read_configured_managed_files(
     root_dir: &Path,
     config: &BasaltConfig,
 ) -> BTreeMap<String, String> {
