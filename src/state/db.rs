@@ -717,10 +717,23 @@ fn resolved_package_transactions(conn: &Connection, run_id: &str) -> Result<Vec<
 fn package_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
-            "select backend || ' ' || change || ' ' || package
+            "select package_snapshot_diff.backend || ' ' ||
+                package_snapshot_diff.change || ' ' ||
+                package_snapshot_diff.package ||
+                coalesce(' ' || package_snapshot_packages.version, '') ||
+                ' [' || coalesce(package_snapshot_packages.reason, 'unknown') || ']'
             from package_snapshot_diff
-            where run_id = ?1
-            order by backend, change, package",
+            left join package_snapshot_packages on
+                package_snapshot_packages.run_id = package_snapshot_diff.run_id
+                and package_snapshot_packages.backend = package_snapshot_diff.backend
+                and package_snapshot_packages.package = package_snapshot_diff.package
+                and package_snapshot_packages.phase = case
+                    when package_snapshot_diff.change = 'added' then 'after'
+                    when package_snapshot_diff.change = 'removed' then 'before'
+                    else package_snapshot_diff.change
+                end
+            where package_snapshot_diff.run_id = ?1
+            order by package_snapshot_diff.backend, package_snapshot_diff.change, package_snapshot_diff.package",
         )
         .map_err(|err| format!("failed to prepare package snapshot inspection: {err}"))?;
     let rows = statement
@@ -915,8 +928,8 @@ mod tests {
         assert_eq!(
             inspection.package_snapshot_changes,
             vec![
-                "pacman added basalt-test".to_string(),
-                "pacman removed old-package".to_string()
+                "pacman added basalt-test [unknown]".to_string(),
+                "pacman removed old-package [unknown]".to_string()
             ]
         );
 
