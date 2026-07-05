@@ -42,30 +42,36 @@ pub fn plan_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Action
         }
 
         if let Some(timezone) = &system.timezone {
-            actions.push(Action {
-                id: "system.timezone".to_string(),
-                domain: "system".to_string(),
-                description: format!("set timezone to `{timezone}`"),
-                risk: Risk::Low,
-            });
+            if current.timezone.as_deref() != Some(timezone.as_str()) {
+                actions.push(Action {
+                    id: "system.timezone".to_string(),
+                    domain: "system".to_string(),
+                    description: format!("set timezone to `{timezone}`"),
+                    risk: Risk::Low,
+                });
+            }
         }
 
         if let Some(locale) = &system.locale {
-            actions.push(Action {
-                id: "system.locale".to_string(),
-                domain: "system".to_string(),
-                description: format!("set locale to `{locale}`"),
-                risk: Risk::Low,
-            });
+            if current.locale.as_deref() != Some(locale.as_str()) {
+                actions.push(Action {
+                    id: "system.locale".to_string(),
+                    domain: "system".to_string(),
+                    description: format!("set locale to `{locale}`"),
+                    risk: Risk::Low,
+                });
+            }
         }
 
         if let Some(keymap) = &system.keymap {
-            actions.push(Action {
-                id: "system.keymap".to_string(),
-                domain: "system".to_string(),
-                description: format!("set keymap to `{keymap}`"),
-                risk: Risk::Low,
-            });
+            if current.keymap.as_deref() != Some(keymap.as_str()) {
+                actions.push(Action {
+                    id: "system.keymap".to_string(),
+                    domain: "system".to_string(),
+                    description: format!("set keymap to `{keymap}`"),
+                    risk: Risk::Low,
+                });
+            }
         }
     }
 
@@ -124,12 +130,14 @@ pub fn plan_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Action
 
     if let Some(files) = &config.files {
         for file in &files.managed {
-            actions.push(Action {
-                id: format!("files.managed.{}", file.path.trim_start_matches('/')),
-                domain: "files".to_string(),
-                description: format!("write managed file `{}`", file.path),
-                risk: Risk::Medium,
-            });
+            if current.managed_files.get(&file.path) != Some(&file.content) {
+                actions.push(Action {
+                    id: format!("files.managed.{}", file.path.trim_start_matches('/')),
+                    domain: "files".to_string(),
+                    description: format!("write managed file `{}`", file.path),
+                    risk: Risk::Medium,
+                });
+            }
         }
     }
 
@@ -188,5 +196,37 @@ mod tests {
         assert!(actions
             .iter()
             .any(|action| action.id == "packages.pacman.base-devel"));
+    }
+
+    #[test]
+    fn skips_system_and_managed_file_actions_that_match_current_state() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-managed-files");
+        let config = validate_config_dir(&root).unwrap();
+        let current = CurrentState {
+            hostname: Some("basalt-vm".to_string()),
+            timezone: Some("UTC".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            keymap: Some("us".to_string()),
+            managed_files: std::collections::BTreeMap::from([(
+                "/etc/basalt/motd".to_string(),
+                "Basalt managed file\n".to_string(),
+            )]),
+            ..CurrentState::default()
+        };
+
+        let actions = plan_actions(&config, &current);
+        assert!(!actions.iter().any(|action| action.id == "system.hostname"));
+        assert!(!actions.iter().any(|action| action.id == "system.timezone"));
+        assert!(!actions.iter().any(|action| action.id == "system.locale"));
+        assert!(!actions.iter().any(|action| action.id == "system.keymap"));
+        assert!(!actions
+            .iter()
+            .any(|action| action.id == "files.managed.etc/basalt/motd"));
+        assert!(actions
+            .iter()
+            .any(|action| action.id == "services.enable.basalt-example"));
     }
 }

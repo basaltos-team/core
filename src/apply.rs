@@ -206,6 +206,9 @@ pub fn apply_supported_config(
     if let Some(files) = &config.files {
         for file in &files.managed {
             let relative_path = managed_file_relative_path(&file.path)?;
+            if !has_action(&actions, &format!("files.managed.{relative_path}")) {
+                continue;
+            }
             write_with_backup(
                 root_dir,
                 &backup_dir,
@@ -679,6 +682,55 @@ mod tests {
             .iter()
             .any(|action| action.id == "files.managed.etc/basalt/motd"));
         assert!(summary.service_operations_path.is_some());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn skips_managed_file_write_when_current_state_matches() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-files-idempotent-test-{}",
+            millis_since_epoch()
+        ));
+        let root = base.join("root");
+        let state = base.join("state");
+        fs::create_dir_all(root.join("usr/share/zoneinfo")).unwrap();
+        fs::write(root.join("usr/share/zoneinfo/UTC"), "UTC").unwrap();
+        fs::create_dir_all(root.join("etc/basalt")).unwrap();
+        fs::write(root.join("etc/basalt/motd"), "Basalt managed file\n").unwrap();
+
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-managed-files");
+        let config = validate_config_dir(&config_dir).unwrap();
+        let current = CurrentState {
+            hostname: Some("basalt-vm".to_string()),
+            timezone: Some("UTC".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            keymap: Some("us".to_string()),
+            managed_files: std::collections::BTreeMap::from([(
+                "/etc/basalt/motd".to_string(),
+                "Basalt managed file\n".to_string(),
+            )]),
+            ..CurrentState::default()
+        };
+        let summary = apply_supported_config(
+            &state,
+            config_dir,
+            &root,
+            &config,
+            &current,
+            PackageExecutorMode::Record,
+            ServiceExecutorMode::Record,
+        )
+        .unwrap();
+
+        assert!(summary.written_files.is_empty());
+        assert!(!summary
+            .actions
+            .iter()
+            .any(|action| action.id == "files.managed.etc/basalt/motd"));
 
         let _ = fs::remove_dir_all(base);
     }

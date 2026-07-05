@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::state::store::{HostStateReader, StateReader};
+use crate::state::store::{CurrentState, HostStateReader, StateReader, TargetRootStateReader};
 
 pub fn run(args: Vec<String>) -> i32 {
     match parse_args(&args) {
@@ -102,7 +102,7 @@ pub fn run(args: Vec<String>) -> i32 {
             package_executor,
             service_executor,
         }) => match crate::config::validate_config_dir(&config_dir) {
-            Ok(config) => match HostStateReader.read_current_state() {
+            Ok(config) => match read_apply_current_state(&root_dir, &config) {
                 Ok(current) => match crate::apply::apply_supported_config(
                     &state_dir,
                     config_dir,
@@ -689,4 +689,15 @@ fn print_help() {
     println!("  basalt service-history --service <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
+}
+
+fn read_apply_current_state(
+    root_dir: &std::path::Path,
+    config: &crate::config::BasaltConfig,
+) -> Result<CurrentState, String> {
+    if root_dir == std::path::Path::new("/") {
+        HostStateReader.read_current_state()
+    } else {
+        TargetRootStateReader::new(root_dir, config).read_current_state()
+    }
 }

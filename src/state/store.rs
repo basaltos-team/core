@@ -1,18 +1,23 @@
 // /var/lib/basalt state persistence.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::BasaltConfig;
 use crate::planning::action::Action;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CurrentState {
     pub hostname: Option<String>,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+    pub keymap: Option<String>,
     pub pacman_packages: BTreeSet<String>,
     pub enabled_services: BTreeSet<String>,
+    pub managed_files: BTreeMap<String, String>,
 }
 
 pub trait StateReader {
@@ -70,10 +75,59 @@ impl StateReader for HostStateReader {
     fn read_current_state(&self) -> Result<CurrentState, String> {
         Ok(CurrentState {
             hostname: crate::system::locale::read_hostname(),
+            timezone: crate::system::locale::read_timezone(Path::new("/")),
+            locale: crate::system::locale::read_locale(Path::new("/")),
+            keymap: crate::system::locale::read_keymap(Path::new("/")),
             pacman_packages: crate::backends::pacman::read_installed_packages(),
             enabled_services: crate::system::services::read_enabled_services(),
+            managed_files: BTreeMap::new(),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetRootStateReader<'a> {
+    root_dir: &'a Path,
+    config: &'a BasaltConfig,
+}
+
+impl<'a> TargetRootStateReader<'a> {
+    pub fn new(root_dir: &'a Path, config: &'a BasaltConfig) -> Self {
+        Self { root_dir, config }
+    }
+}
+
+impl StateReader for TargetRootStateReader<'_> {
+    fn read_current_state(&self) -> Result<CurrentState, String> {
+        Ok(CurrentState {
+            hostname: crate::system::locale::read_hostname_from_root(self.root_dir),
+            timezone: crate::system::locale::read_timezone(self.root_dir),
+            locale: crate::system::locale::read_locale(self.root_dir),
+            keymap: crate::system::locale::read_keymap(self.root_dir),
+            pacman_packages: BTreeSet::new(),
+            enabled_services: BTreeSet::new(),
+            managed_files: read_configured_managed_files(self.root_dir, self.config),
+        })
+    }
+}
+
+fn read_configured_managed_files(
+    root_dir: &Path,
+    config: &BasaltConfig,
+) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let Some(files_config) = &config.files else {
+        return files;
+    };
+
+    for managed in &files_config.managed {
+        let relative_path = managed.path.trim_start_matches('/');
+        let path = root_dir.join(relative_path);
+        if let Ok(contents) = fs::read_to_string(path) {
+            files.insert(managed.path.clone(), contents);
+        }
+    }
+    files
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +299,51 @@ mod tests {
 
         let state = reader.read_current_state().unwrap();
         assert_eq!(state.hostname.as_deref(), Some("basalt-vm"));
+    }
+
+    #[test]
+    fn target_root_reader_reads_system_and_configured_files() {
+        let base =
+            std::env::temp_dir().join(format!("basalt-target-root-state-{}", std::process::id()));
+        let root = base.join("root");
+        fs::create_dir_all(root.join("etc/basalt")).unwrap();
+        fs::create_dir_all(root.join("usr/share/zoneinfo")).unwrap();
+        fs::write(root.join("etc/hostname"), "basalt-vm\n").unwrap();
+        fs::write(root.join("etc/locale.conf"), "LANG=en_US.UTF-8\n").unwrap();
+        fs::write(root.join("etc/vconsole.conf"), "KEYMAP=us\n").unwrap();
+        fs::write(root.join("usr/share/zoneinfo/UTC"), "UTC\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/share/zoneinfo/UTC", root.join("etc/localtime")).unwrap();
+        fs::write(root.join("etc/basalt/motd"), "Basalt managed file\n").unwrap();
+
+        let config = BasaltConfig {
+            files: Some(crate::config::types::FilesConfig {
+                managed: vec![crate::config::types::ManagedFileConfig {
+                    path: "/etc/basalt/motd".to_string(),
+                    content: "Basalt managed file\n".to_string(),
+                    mode: None,
+                }],
+            }),
+            ..BasaltConfig::default()
+        };
+
+        let state = TargetRootStateReader::new(&root, &config)
+            .read_current_state()
+            .unwrap();
+        assert_eq!(state.hostname.as_deref(), Some("basalt-vm"));
+        assert_eq!(state.locale.as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(state.keymap.as_deref(), Some("us"));
+        #[cfg(unix)]
+        assert_eq!(state.timezone.as_deref(), Some("UTC"));
+        assert_eq!(
+            state
+                .managed_files
+                .get("/etc/basalt/motd")
+                .map(String::as_str),
+            Some("Basalt managed file\n")
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
