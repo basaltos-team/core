@@ -127,7 +127,7 @@ fn render_services(config: &BasaltConfig, current: &CurrentState, out: &mut Stri
     out.push_str("services:\n");
     if let Some(services) = &config.services {
         push_service_list(out, "enable", &services.enable, &current.enabled_services);
-        push_list(out, "disable", &services.disable);
+        push_service_disable_list(out, "disable", &services.disable, &current.enabled_services);
     } else {
         out.push_str("  none\n");
     }
@@ -225,6 +225,35 @@ fn push_service_list(
             "="
         } else {
             "+"
+        };
+        out.push_str("    ");
+        out.push_str(marker);
+        out.push(' ');
+        out.push_str(value);
+        out.push('\n');
+    }
+}
+
+fn push_service_disable_list(
+    out: &mut String,
+    key: &str,
+    values: &[String],
+    current: &std::collections::BTreeSet<String>,
+) {
+    out.push_str("  ");
+    out.push_str(key);
+    out.push_str(":\n");
+    if values.is_empty() {
+        out.push_str("    none\n");
+        return;
+    }
+
+    for value in values {
+        let service_unit = format!("{value}.service");
+        let marker = if current.contains(value) || current.contains(&service_unit) {
+            "+"
+        } else {
+            "="
         };
         out.push_str("    ");
         out.push_str(marker);

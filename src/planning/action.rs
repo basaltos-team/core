@@ -119,12 +119,14 @@ pub fn plan_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Action
         }
 
         for service in &services.disable {
-            actions.push(Action {
-                id: format!("services.disable.{service}"),
-                domain: "services".to_string(),
-                description: format!("disable service `{service}`"),
-                risk: Risk::High,
-            });
+            if service_is_enabled(service, &current.enabled_services) {
+                actions.push(Action {
+                    id: format!("services.disable.{service}"),
+                    domain: "services".to_string(),
+                    description: format!("disable service `{service}`"),
+                    risk: Risk::High,
+                });
+            }
         }
     }
 
@@ -142,6 +144,17 @@ pub fn plan_actions(config: &BasaltConfig, current: &CurrentState) -> Vec<Action
     }
 
     actions
+}
+
+fn service_is_enabled(service: &str, enabled: &std::collections::BTreeSet<String>) -> bool {
+    if enabled.contains(service) {
+        return true;
+    }
+    if let Some(short) = service.strip_suffix(".service") {
+        enabled.contains(short)
+    } else {
+        enabled.contains(&format!("{service}.service"))
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +241,26 @@ mod tests {
         assert!(actions
             .iter()
             .any(|action| action.id == "services.enable.basalt-example"));
+        assert!(!actions
+            .iter()
+            .any(|action| action.id == "services.disable.old-example"));
+    }
+
+    #[test]
+    fn plans_service_disable_only_when_service_is_enabled() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-managed-files");
+        let config = validate_config_dir(&root).unwrap();
+        let current = CurrentState {
+            enabled_services: std::collections::BTreeSet::from(["old-example.service".to_string()]),
+            ..CurrentState::default()
+        };
+
+        let actions = plan_actions(&config, &current);
+        assert!(actions
+            .iter()
+            .any(|action| action.id == "services.disable.old-example"));
     }
 }
