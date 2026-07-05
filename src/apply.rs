@@ -3,8 +3,9 @@
 use crate::backends::aur::resolve_aur_install_transaction;
 use crate::backends::nix::resolve_nix_install_transaction;
 use crate::backends::pacman::{
-    resolve_pacman_install_transaction, write_package_operations_log, PackageBackend,
-    PackageExecutor, PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
+    read_installed_package_snapshot, resolve_pacman_install_transaction,
+    write_package_operations_log, HostPackageExecutor, PackageBackend, PackageExecutor,
+    PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
@@ -212,6 +213,7 @@ pub fn apply_supported_config(
     }
 
     let package_operations_path = apply_package_operations(state_dir, &actions, package_executor)?;
+    let pacman_snapshot_after = pacman_snapshot_after(current, package_executor);
     let transactions = resolve_package_transactions_for_actions(&actions)?;
     let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
 
@@ -229,9 +231,7 @@ pub fn apply_supported_config(
             pacman_snapshot_before: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
-            pacman_snapshot_after: Some(PackageSnapshot::from_names(
-                current.pacman_packages.clone(),
-            )),
+            pacman_snapshot_after: Some(pacman_snapshot_after),
             pacman_transaction: Some(transactions.pacman),
             aur_transaction: Some(transactions.aur),
             nix_transaction: Some(transactions.nix),
@@ -282,7 +282,24 @@ fn apply_package_operations(
     actions: &[Action],
     mode: PackageExecutorMode,
 ) -> Result<Option<PathBuf>, String> {
-    let mut executor = RecordingPackageExecutor::default();
+    match mode {
+        PackageExecutorMode::Record => {
+            let mut executor = RecordingPackageExecutor::default();
+            apply_package_actions(actions, &mut executor)?;
+            write_package_operations_log(state_dir, executor.operations())
+        }
+        PackageExecutorMode::Host => {
+            let mut executor = HostPackageExecutor::default();
+            apply_package_actions(actions, &mut executor)?;
+            write_package_operations_log(state_dir, executor.operations())
+        }
+    }
+}
+
+fn apply_package_actions(
+    actions: &[Action],
+    executor: &mut dyn PackageExecutor,
+) -> Result<(), String> {
     for action in actions {
         if let Some(package) = action.id.strip_prefix("packages.pacman.") {
             executor.ensure_installed(PackageBackend::Pacman, package)?;
@@ -292,18 +309,7 @@ fn apply_package_operations(
             executor.ensure_installed(PackageBackend::Nix, package)?;
         }
     }
-
-    match mode {
-        PackageExecutorMode::Record => {}
-        PackageExecutorMode::Host => {
-            return Err(
-                "`--package-executor host` is not implemented yet; use `--package-executor record`"
-                    .to_string(),
-            )
-        }
-    }
-
-    write_package_operations_log(state_dir, executor.operations())
+    Ok(())
 }
 
 fn validate_package_executor_policy(
@@ -323,10 +329,33 @@ fn validate_package_executor_policy(
         return Err("`--package-executor host` requires `--root /`".to_string());
     }
 
-    Err(
-        "`--package-executor host` is not implemented yet; use `--package-executor record` until pacman/AUR/Nix mutation has Arch VM coverage"
-            .to_string(),
-    )
+    let unsupported: Vec<&str> = actions
+        .iter()
+        .filter_map(|action| {
+            if action.id.starts_with("packages.aur.") {
+                Some("AUR")
+            } else if action.id.starts_with("packages.nix.") {
+                Some("Nix")
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(
+            "`--package-executor host` currently supports pacman packages only; AUR and Nix host execution are not implemented yet"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn pacman_snapshot_after(current: &CurrentState, mode: PackageExecutorMode) -> PackageSnapshot {
+    match mode {
+        PackageExecutorMode::Record => PackageSnapshot::from_names(current.pacman_packages.clone()),
+        PackageExecutorMode::Host => read_installed_package_snapshot(),
+    }
 }
 
 fn write_with_backup(
@@ -684,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn host_package_executor_is_guarded_until_real_mutation_exists() {
+    fn host_package_executor_rejects_aur_and_nix_until_real_mutation_exists() {
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -703,7 +732,7 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("not implemented yet"));
-        assert!(err.contains("Arch VM coverage"));
+        assert!(err.contains("AUR and Nix"));
     }
 
     #[test]

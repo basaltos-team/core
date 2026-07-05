@@ -322,6 +322,58 @@ impl PackageExecutor for RecordingPackageExecutor {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct HostPackageExecutor {
+    operations: Vec<PackageOperation>,
+}
+
+impl HostPackageExecutor {
+    pub fn operations(&self) -> &[PackageOperation] {
+        &self.operations
+    }
+}
+
+impl PackageExecutor for HostPackageExecutor {
+    fn ensure_installed(&mut self, backend: PackageBackend, package: &str) -> Result<(), String> {
+        match backend {
+            PackageBackend::Pacman => {
+                install_pacman_package(package)?;
+                self.operations.push(PackageOperation {
+                    backend,
+                    action: PackageAction::EnsureInstalled,
+                    package: package.to_string(),
+                });
+                Ok(())
+            }
+            PackageBackend::Aur => {
+                Err("AUR host package execution is not implemented yet".to_string())
+            }
+            PackageBackend::Nix => {
+                Err("Nix host package execution is not implemented yet".to_string())
+            }
+        }
+    }
+}
+
+fn install_pacman_package(package: &str) -> Result<(), String> {
+    let package = package.trim();
+    if package.is_empty() {
+        return Ok(());
+    }
+
+    let output = run_capture("pacman", &["-S", "--needed", "--noconfirm", package])?;
+    if output.status_code == Some(0) {
+        return Ok(());
+    }
+
+    let detail = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    Err(format!("pacman failed to install `{package}`: {detail}"))
+}
+
 pub fn write_package_operations_log(
     state_dir: &Path,
     operations: &[PackageOperation],
