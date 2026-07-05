@@ -1,5 +1,6 @@
 // SQLite index for run records and operation artifacts.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,18 +10,21 @@ use crate::backends::pacman::{PackageBackend, PackageSnapshot, PackageTransactio
 use crate::state::store::RunRecord;
 
 const STATE_DB: &str = "state.db";
-const MIGRATION_VERSION: i64 = 5;
+const MIGRATION_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Default)]
 pub struct StateDbArtifacts {
     pub run_json_path: PathBuf,
     pub latest_json_path: PathBuf,
     pub package_intent: Vec<PackageIntent>,
+    pub service_intent: Vec<ServiceIntent>,
     pub package_operations_path: Option<PathBuf>,
     pub service_operations_path: Option<PathBuf>,
     pub backup_dir: Option<PathBuf>,
     pub pacman_snapshot_before: Option<PackageSnapshot>,
     pub pacman_snapshot_after: Option<PackageSnapshot>,
+    pub enabled_services_before: Option<BTreeSet<String>>,
+    pub enabled_services_after: Option<BTreeSet<String>>,
     pub pacman_transaction: Option<PackageTransaction>,
     pub aur_transaction: Option<PackageTransaction>,
     pub nix_transaction: Option<PackageTransaction>,
@@ -30,6 +34,12 @@ pub struct StateDbArtifacts {
 pub struct PackageIntent {
     pub backend: PackageBackend,
     pub package: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceIntent {
+    pub action: String,
+    pub service: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +57,15 @@ pub struct HistoryRow {
 pub struct RunInspection {
     pub id: String,
     pub declared_packages: Vec<String>,
+    pub declared_services: Vec<String>,
     pub package_transaction_statuses: Vec<String>,
     pub resolved_package_transactions: Vec<String>,
     pub requested_package_operations: Vec<String>,
+    pub requested_service_operations: Vec<String>,
     pub package_snapshot_changes: Vec<String>,
+    pub service_snapshot_changes: Vec<String>,
     pub package_result_audit: Vec<String>,
+    pub service_result_audit: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +190,24 @@ pub fn index_run(
     }
 
     tx.execute(
+        "delete from service_intent where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed service intent: {err}"))?;
+    for (index, intent) in artifacts.service_intent.iter().enumerate() {
+        tx.execute(
+            "insert into service_intent (
+                run_id,
+                intent_index,
+                action,
+                service
+            ) values (?1, ?2, ?3, ?4)",
+            params![record.id, index as i64, intent.action, intent.service],
+        )
+        .map_err(|err| format!("failed to index service intent `{}`: {err}", intent.service))?;
+    }
+
+    tx.execute(
         "delete from package_operations where run_id = ?1",
         params![record.id],
     )
@@ -239,6 +271,34 @@ pub fn index_run(
         &artifacts.pacman_snapshot_after,
     ) {
         index_package_snapshot_diff(&tx, &record.id, "pacman", before, after)?;
+    }
+
+    tx.execute(
+        "delete from service_snapshot_services where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed service snapshots: {err}"))?;
+    tx.execute(
+        "delete from service_snapshots where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed service snapshot metadata: {err}"))?;
+    tx.execute(
+        "delete from service_snapshot_diff where run_id = ?1",
+        params![record.id],
+    )
+    .map_err(|err| format!("failed to replace indexed service snapshot diff: {err}"))?;
+    if let Some(services) = &artifacts.enabled_services_before {
+        index_service_snapshot(&tx, &record.id, "before", services)?;
+    }
+    if let Some(services) = &artifacts.enabled_services_after {
+        index_service_snapshot(&tx, &record.id, "after", services)?;
+    }
+    if let (Some(before), Some(after)) = (
+        &artifacts.enabled_services_before,
+        &artifacts.enabled_services_after,
+    ) {
+        index_service_snapshot_diff(&tx, &record.id, before, after)?;
     }
 
     tx.commit()
@@ -402,11 +462,15 @@ pub fn inspect_run(state_dir: &Path, run_id: Option<&str>) -> Result<RunInspecti
 
     Ok(RunInspection {
         declared_packages: declared_packages(&conn, &id)?,
+        declared_services: declared_services(&conn, &id)?,
         package_transaction_statuses: package_transaction_statuses(&conn, &id)?,
         resolved_package_transactions: resolved_package_transactions(&conn, &id)?,
         requested_package_operations: requested_package_operations(&conn, &id)?,
+        requested_service_operations: requested_service_operations(&conn, &id)?,
         package_snapshot_changes: package_snapshot_changes(&conn, &id)?,
+        service_snapshot_changes: service_snapshot_changes(&conn, &id)?,
         package_result_audit: package_result_audit(&conn, &id)?,
+        service_result_audit: service_result_audit(&conn, &id)?,
         id,
     })
 }
@@ -419,6 +483,11 @@ pub fn render_run_inspection(inspection: &RunInspection) -> String {
         &mut out,
         "Declared package intent",
         &inspection.declared_packages,
+    );
+    push_list(
+        &mut out,
+        "Declared service intent",
+        &inspection.declared_services,
     );
     push_list(
         &mut out,
@@ -437,13 +506,28 @@ pub fn render_run_inspection(inspection: &RunInspection) -> String {
     );
     push_list(
         &mut out,
+        "Requested service operations",
+        &inspection.requested_service_operations,
+    );
+    push_list(
+        &mut out,
         "Actual package snapshot changes",
         &inspection.package_snapshot_changes,
     );
     push_list(
         &mut out,
+        "Actual service snapshot changes",
+        &inspection.service_snapshot_changes,
+    );
+    push_list(
+        &mut out,
         "Package result audit",
         &inspection.package_result_audit,
+    );
+    push_list(
+        &mut out,
+        "Service result audit",
+        &inspection.service_result_audit,
     );
     out
 }
@@ -512,6 +596,39 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             foreign key (run_id) references runs(id) on delete cascade
         );
 
+        create table if not exists service_intent (
+            run_id text not null,
+            intent_index integer not null,
+            action text not null,
+            service text not null,
+            primary key (run_id, intent_index),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists service_snapshots (
+            run_id text not null,
+            phase text not null,
+            service_count integer not null,
+            primary key (run_id, phase),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists service_snapshot_services (
+            run_id text not null,
+            phase text not null,
+            service text not null,
+            primary key (run_id, phase, service),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
+        create table if not exists service_snapshot_diff (
+            run_id text not null,
+            service text not null,
+            change text not null,
+            primary key (run_id, service, change),
+            foreign key (run_id) references runs(id) on delete cascade
+        );
+
         create table if not exists package_snapshots (
             run_id text not null,
             phase text not null,
@@ -567,7 +684,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         create index if not exists idx_actions_domain on actions(domain);
         create index if not exists idx_package_intent_package on package_intent(package);
         create index if not exists idx_package_operations_package on package_operations(package);
+        create index if not exists idx_service_intent_service on service_intent(service);
         create index if not exists idx_service_operations_service on service_operations(service);
+        create index if not exists idx_service_snapshot_services_service on service_snapshot_services(service);
+        create index if not exists idx_service_snapshot_diff_change on service_snapshot_diff(change);
         create index if not exists idx_package_snapshot_packages_package on package_snapshot_packages(package);
         create index if not exists idx_package_snapshot_diff_change on package_snapshot_diff(change);
         create index if not exists idx_package_transaction_rows_package on package_transaction_rows(package);
@@ -766,6 +886,51 @@ fn index_package_snapshot_diff(
     Ok(())
 }
 
+fn index_service_snapshot(
+    conn: &Connection,
+    run_id: &str,
+    phase: &str,
+    services: &BTreeSet<String>,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into service_snapshots (
+            run_id,
+            phase,
+            service_count
+        ) values (?1, ?2, ?3)",
+        params![run_id, phase, services.len() as i64],
+    )
+    .map_err(|err| format!("failed to index {phase} service snapshot: {err}"))?;
+
+    for service in services {
+        conn.execute(
+            "insert into service_snapshot_services (
+                run_id,
+                phase,
+                service
+            ) values (?1, ?2, ?3)",
+            params![run_id, phase, service],
+        )
+        .map_err(|err| format!("failed to index service snapshot row `{service}`: {err}"))?;
+    }
+    Ok(())
+}
+
+fn index_service_snapshot_diff(
+    conn: &Connection,
+    run_id: &str,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+) -> Result<(), String> {
+    for service in after.difference(before) {
+        insert_service_snapshot_change(conn, run_id, service, "enabled")?;
+    }
+    for service in before.difference(after) {
+        insert_service_snapshot_change(conn, run_id, service, "disabled")?;
+    }
+    Ok(())
+}
+
 fn insert_package_snapshot_change(
     conn: &Connection,
     run_id: &str,
@@ -783,6 +948,24 @@ fn insert_package_snapshot_change(
         params![run_id, backend, package, change],
     )
     .map_err(|err| format!("failed to index package snapshot change `{package}`: {err}"))?;
+    Ok(())
+}
+
+fn insert_service_snapshot_change(
+    conn: &Connection,
+    run_id: &str,
+    service: &str,
+    change: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into service_snapshot_diff (
+            run_id,
+            service,
+            change
+        ) values (?1, ?2, ?3)",
+        params![run_id, service, change],
+    )
+    .map_err(|err| format!("failed to index service snapshot change `{service}`: {err}"))?;
     Ok(())
 }
 
@@ -806,6 +989,17 @@ fn declared_packages(conn: &Connection, run_id: &str) -> Result<Vec<String>, Str
     )
 }
 
+fn declared_services(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    query_strings(
+        conn,
+        "select 'services.' || action || '.' || service
+        from service_intent
+        where run_id = ?1
+        order by intent_index",
+        run_id,
+    )
+}
+
 fn requested_package_operations(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
@@ -818,6 +1012,21 @@ fn requested_package_operations(conn: &Connection, run_id: &str) -> Result<Vec<S
     let rows = statement
         .query_map(params![run_id], |row| row.get(0))
         .map_err(|err| format!("failed to inspect package operations: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn requested_service_operations(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select action || ' ' || service
+            from service_operations
+            where run_id = ?1
+            order by operation_index",
+        )
+        .map_err(|err| format!("failed to prepare service operation inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect service operations: {err}"))?;
     collect_string_rows(rows)
 }
 
@@ -881,6 +1090,21 @@ fn package_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<Strin
     let rows = statement
         .query_map(params![run_id], |row| row.get(0))
         .map_err(|err| format!("failed to inspect package snapshot changes: {err}"))?;
+    collect_string_rows(rows)
+}
+
+fn service_snapshot_changes(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "select change || ' ' || service
+            from service_snapshot_diff
+            where run_id = ?1
+            order by change, service",
+        )
+        .map_err(|err| format!("failed to prepare service snapshot inspection: {err}"))?;
+    let rows = statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect service snapshot changes: {err}"))?;
     collect_string_rows(rows)
 }
 
@@ -1030,6 +1254,224 @@ fn package_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, 
     let unexpected_rows = unexpected_statement
         .query_map(params![run_id], |row| row.get(0))
         .map_err(|err| format!("failed to inspect unexpected package result audit: {err}"))?;
+    values.extend(collect_string_rows(unexpected_rows)?);
+
+    Ok(values)
+}
+
+fn service_result_audit(conn: &Connection, run_id: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+
+    let mut observed_statement = conn
+        .prepare(
+            "select service_operations.action || ' ' ||
+                service_operations.service || ' observed'
+            from service_operations
+            inner join service_snapshot_diff on
+                service_snapshot_diff.run_id = service_operations.run_id
+                and service_snapshot_diff.service = service_operations.service
+                and (
+                    (service_operations.action = 'enable' and service_snapshot_diff.change = 'enabled')
+                    or (service_operations.action = 'disable' and service_snapshot_diff.change = 'disabled')
+                )
+            where service_operations.run_id = ?1
+            order by service_operations.action, service_operations.service",
+        )
+        .map_err(|err| format!("failed to prepare service result audit: {err}"))?;
+    let observed_rows = observed_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect service result audit: {err}"))?;
+    values.extend(collect_string_rows(observed_rows)?);
+
+    let mut intent_satisfied_statement = conn
+        .prepare(
+            "select service_intent.action || ' ' ||
+                service_intent.service || ' already satisfied'
+            from service_intent
+            where service_intent.run_id = ?1
+                and (
+                    (
+                        service_intent.action = 'enable'
+                        and exists (
+                            select 1
+                            from service_snapshot_services before_snapshot
+                            where before_snapshot.run_id = service_intent.run_id
+                                and before_snapshot.phase = 'before'
+                                and before_snapshot.service = service_intent.service
+                        )
+                        and exists (
+                            select 1
+                            from service_snapshot_services after_snapshot
+                            where after_snapshot.run_id = service_intent.run_id
+                                and after_snapshot.phase = 'after'
+                                and after_snapshot.service = service_intent.service
+                        )
+                    )
+                    or (
+                        service_intent.action = 'disable'
+                        and not exists (
+                            select 1
+                            from service_snapshot_services before_snapshot
+                            where before_snapshot.run_id = service_intent.run_id
+                                and before_snapshot.phase = 'before'
+                                and before_snapshot.service = service_intent.service
+                        )
+                        and not exists (
+                            select 1
+                            from service_snapshot_services after_snapshot
+                            where after_snapshot.run_id = service_intent.run_id
+                                and after_snapshot.phase = 'after'
+                                and after_snapshot.service = service_intent.service
+                        )
+                    )
+                )
+                and not exists (
+                    select 1
+                    from service_operations
+                    where service_operations.run_id = service_intent.run_id
+                        and service_operations.action = service_intent.action
+                        and service_operations.service = service_intent.service
+                )
+            order by service_intent.action, service_intent.service",
+        )
+        .map_err(|err| format!("failed to prepare intent service result audit: {err}"))?;
+    let intent_satisfied_rows = intent_satisfied_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect intent service result audit: {err}"))?;
+    values.extend(collect_string_rows(intent_satisfied_rows)?);
+
+    let mut satisfied_statement = conn
+        .prepare(
+            "select service_operations.action || ' ' ||
+                service_operations.service || ' already satisfied'
+            from service_operations
+            where service_operations.run_id = ?1
+                and (
+                    (
+                        service_operations.action = 'enable'
+                        and exists (
+                            select 1
+                            from service_snapshot_services before_snapshot
+                            where before_snapshot.run_id = service_operations.run_id
+                                and before_snapshot.phase = 'before'
+                                and before_snapshot.service = service_operations.service
+                        )
+                        and exists (
+                            select 1
+                            from service_snapshot_services after_snapshot
+                            where after_snapshot.run_id = service_operations.run_id
+                                and after_snapshot.phase = 'after'
+                                and after_snapshot.service = service_operations.service
+                        )
+                    )
+                    or (
+                        service_operations.action = 'disable'
+                        and not exists (
+                            select 1
+                            from service_snapshot_services before_snapshot
+                            where before_snapshot.run_id = service_operations.run_id
+                                and before_snapshot.phase = 'before'
+                                and before_snapshot.service = service_operations.service
+                        )
+                        and not exists (
+                            select 1
+                            from service_snapshot_services after_snapshot
+                            where after_snapshot.run_id = service_operations.run_id
+                                and after_snapshot.phase = 'after'
+                                and after_snapshot.service = service_operations.service
+                        )
+                    )
+                )
+                and not exists (
+                    select 1
+                    from service_snapshot_diff
+                    where service_snapshot_diff.run_id = service_operations.run_id
+                        and service_snapshot_diff.service = service_operations.service
+                        and (
+                            (service_operations.action = 'enable' and service_snapshot_diff.change = 'enabled')
+                            or (service_operations.action = 'disable' and service_snapshot_diff.change = 'disabled')
+                        )
+                )
+            order by service_operations.action, service_operations.service",
+        )
+        .map_err(|err| format!("failed to prepare satisfied service result audit: {err}"))?;
+    let satisfied_rows = satisfied_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect satisfied service result audit: {err}"))?;
+    values.extend(collect_string_rows(satisfied_rows)?);
+
+    let mut missing_statement = conn
+        .prepare(
+            "select service_operations.action || ' ' ||
+                service_operations.service || ' missing from actual service snapshot changes'
+            from service_operations
+            where service_operations.run_id = ?1
+                and exists (
+                    select 1
+                    from service_snapshots
+                    where service_snapshots.run_id = service_operations.run_id
+                )
+                and not exists (
+                    select 1
+                    from service_snapshot_diff
+                    where service_snapshot_diff.run_id = service_operations.run_id
+                        and service_snapshot_diff.service = service_operations.service
+                        and (
+                            (service_operations.action = 'enable' and service_snapshot_diff.change = 'enabled')
+                            or (service_operations.action = 'disable' and service_snapshot_diff.change = 'disabled')
+                        )
+                )
+                and not (
+                    (
+                        service_operations.action = 'enable'
+                        and exists (
+                            select 1
+                            from service_snapshot_services
+                            where service_snapshot_services.run_id = service_operations.run_id
+                                and service_snapshot_services.phase = 'after'
+                                and service_snapshot_services.service = service_operations.service
+                        )
+                    )
+                    or (
+                        service_operations.action = 'disable'
+                        and not exists (
+                            select 1
+                            from service_snapshot_services
+                            where service_snapshot_services.run_id = service_operations.run_id
+                                and service_snapshot_services.phase = 'after'
+                                and service_snapshot_services.service = service_operations.service
+                        )
+                    )
+                )
+            order by service_operations.action, service_operations.service",
+        )
+        .map_err(|err| format!("failed to prepare missing service result audit: {err}"))?;
+    let missing_rows = missing_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect missing service result audit: {err}"))?;
+    values.extend(collect_string_rows(missing_rows)?);
+
+    let mut unexpected_statement = conn
+        .prepare(
+            "select change || ' ' || service || ' without requested service operation'
+            from service_snapshot_diff
+            where run_id = ?1
+                and not exists (
+                    select 1
+                    from service_operations
+                    where service_operations.run_id = service_snapshot_diff.run_id
+                        and service_operations.service = service_snapshot_diff.service
+                        and (
+                            (service_operations.action = 'enable' and service_snapshot_diff.change = 'enabled')
+                            or (service_operations.action = 'disable' and service_snapshot_diff.change = 'disabled')
+                        )
+                )
+            order by change, service",
+        )
+        .map_err(|err| format!("failed to prepare unexpected service result audit: {err}"))?;
+    let unexpected_rows = unexpected_statement
+        .query_map(params![run_id], |row| row.get(0))
+        .map_err(|err| format!("failed to inspect unexpected service result audit: {err}"))?;
     values.extend(collect_string_rows(unexpected_rows)?);
 
     Ok(values)
@@ -1256,6 +1698,10 @@ mod tests {
                     package: "hello".to_string(),
                 },
             ],
+            service_intent: vec![ServiceIntent {
+                action: "enable".to_string(),
+                service: "basalt-example.service".to_string(),
+            }],
             package_operations_path: Some(package_log),
             service_operations_path: Some(service_log),
             backup_dir: Some(base.join("backups").join("apply-test")),
@@ -1265,6 +1711,8 @@ mod tests {
             pacman_snapshot_after: Some(crate::backends::pacman::PackageSnapshot::from_names(
                 std::collections::BTreeSet::from(["basalt-test".to_string()]),
             )),
+            enabled_services_before: Some(BTreeSet::new()),
+            enabled_services_after: Some(BTreeSet::from(["basalt-example.service".to_string()])),
             pacman_transaction: Some(crate::backends::pacman::PackageTransaction {
                 status: PackageResolutionStatus::Resolved,
                 message: None,
@@ -1303,6 +1751,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            inspection.declared_services,
+            vec!["services.enable.basalt-example.service"]
+        );
+        assert_eq!(
             inspection.package_transaction_statuses,
             vec![
                 "aur: skipped - AUR transaction resolution is not implemented yet",
@@ -1323,6 +1775,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            inspection.requested_service_operations,
+            vec!["enable basalt-example.service"]
+        );
+        assert_eq!(
             inspection.package_snapshot_changes,
             vec![
                 "pacman added basalt-test [unknown]".to_string(),
@@ -1330,11 +1786,19 @@ mod tests {
             ]
         );
         assert_eq!(
+            inspection.service_snapshot_changes,
+            vec!["enabled basalt-example.service"]
+        );
+        assert_eq!(
             inspection.package_result_audit,
             vec![
                 "pacman install basalt-test observed".to_string(),
                 "pacman removed old-package without resolved transaction row".to_string()
             ]
+        );
+        assert_eq!(
+            inspection.service_result_audit,
+            vec!["enable basalt-example.service observed"]
         );
 
         let rendered = render_history(&rows);
@@ -1344,10 +1808,13 @@ mod tests {
 
         let inspection_rendered = render_run_inspection(&inspection);
         assert!(inspection_rendered.contains("Declared package intent"));
+        assert!(inspection_rendered.contains("Declared service intent"));
         assert!(inspection_rendered.contains("Package transaction resolution"));
         assert!(inspection_rendered.contains("Resolved package transactions"));
         assert!(inspection_rendered.contains("Actual package snapshot changes"));
+        assert!(inspection_rendered.contains("Actual service snapshot changes"));
         assert!(inspection_rendered.contains("Package result audit"));
+        assert!(inspection_rendered.contains("Service result audit"));
 
         let _ = fs::remove_dir_all(base);
     }
@@ -1439,6 +1906,47 @@ mod tests {
         assert_eq!(
             inspection.package_result_audit,
             vec!["pacman install tree already satisfied"]
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn service_result_audit_marks_declared_intent_satisfied_without_operation() {
+        let base = temp_dir("state-db-service-intent-satisfied-test");
+        fs::create_dir_all(&base).unwrap();
+
+        let record = RunRecord::apply(
+            PathBuf::from("config"),
+            Vec::new(),
+            &CurrentState {
+                enabled_services: BTreeSet::from(["NetworkManager".to_string()]),
+                ..CurrentState::default()
+            },
+        );
+        let snapshot = BTreeSet::from(["NetworkManager".to_string()]);
+        let artifacts = StateDbArtifacts {
+            run_json_path: base.join("runs").join(&record.id).join("run.json"),
+            latest_json_path: base.join("latest-run.json"),
+            service_intent: vec![ServiceIntent {
+                action: "enable".to_string(),
+                service: "NetworkManager".to_string(),
+            }],
+            enabled_services_before: Some(snapshot.clone()),
+            enabled_services_after: Some(snapshot),
+            ..StateDbArtifacts::default()
+        };
+
+        index_run(&base, &record, &artifacts).unwrap();
+
+        let inspection = inspect_run(&base, Some(&record.id)).unwrap();
+        assert_eq!(
+            inspection.declared_services,
+            vec!["services.enable.NetworkManager"]
+        );
+        assert_eq!(
+            inspection.service_result_audit,
+            vec!["enable NetworkManager already satisfied"]
         );
 
         let _ = fs::remove_dir_all(base);

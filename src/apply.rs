@@ -9,8 +9,10 @@ use crate::backends::pacman::{
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
-use crate::state::db::{index_run, PackageIntent, StateDbArtifacts};
-use crate::state::store::{write_run_record, CurrentState, RunRecord, StateLock};
+use crate::state::db::{index_run, PackageIntent, ServiceIntent, StateDbArtifacts};
+use crate::state::store::{
+    write_run_record, CurrentState, HostStateReader, RunRecord, StateLock, StateReader,
+};
 use crate::system::services::{
     write_service_operations_log, HostServiceExecutor, RecordingServiceExecutor, ServiceExecutor,
 };
@@ -90,12 +92,15 @@ pub fn write_dry_run_record(
             run_json_path: run_path.clone(),
             latest_json_path: latest_path.clone(),
             package_intent: package_intent_from_config(config),
+            service_intent: service_intent_from_config(config),
             pacman_snapshot_before: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
             pacman_snapshot_after: Some(PackageSnapshot::from_names(
                 current.pacman_packages.clone(),
             )),
+            enabled_services_before: Some(current.enabled_services.clone()),
+            enabled_services_after: Some(current.enabled_services.clone()),
             pacman_transaction: Some(transactions.pacman),
             aur_transaction: Some(transactions.aur),
             nix_transaction: Some(transactions.nix),
@@ -218,6 +223,7 @@ pub fn apply_supported_config(
     let pacman_snapshot_after = pacman_snapshot_after(current, package_executor);
     let transactions = resolve_package_transactions_for_actions(&actions)?;
     let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
+    let enabled_services_after = service_snapshot_after(current, service_executor)?;
 
     let record = RunRecord::apply(config_dir, actions.clone(), current);
     let (run_path, latest_path) = write_run_record(state_dir, &record)?;
@@ -228,6 +234,7 @@ pub fn apply_supported_config(
             run_json_path: run_path.clone(),
             latest_json_path: latest_path.clone(),
             package_intent: package_intent_from_config(config),
+            service_intent: service_intent_from_config(config),
             package_operations_path: package_operations_path.clone(),
             service_operations_path: service_operations_path.clone(),
             backup_dir: Some(backup_dir.clone()),
@@ -235,6 +242,8 @@ pub fn apply_supported_config(
                 current.pacman_packages.clone(),
             )),
             pacman_snapshot_after: Some(pacman_snapshot_after),
+            enabled_services_before: Some(current.enabled_services.clone()),
+            enabled_services_after: Some(enabled_services_after),
             pacman_transaction: Some(transactions.pacman),
             aur_transaction: Some(transactions.aur),
             nix_transaction: Some(transactions.nix),
@@ -268,6 +277,21 @@ fn package_intent_from_config(config: &BasaltConfig) -> Vec<PackageIntent> {
         intent.extend(packages.nix.iter().map(|package| PackageIntent {
             backend: PackageBackend::Nix,
             package: package.to_string(),
+        }));
+    }
+    intent
+}
+
+fn service_intent_from_config(config: &BasaltConfig) -> Vec<ServiceIntent> {
+    let mut intent = Vec::new();
+    if let Some(services) = &config.services {
+        intent.extend(services.enable.iter().map(|service| ServiceIntent {
+            action: "enable".to_string(),
+            service: service.to_string(),
+        }));
+        intent.extend(services.disable.iter().map(|service| ServiceIntent {
+            action: "disable".to_string(),
+            service: service.to_string(),
         }));
     }
     intent
@@ -377,6 +401,16 @@ fn pacman_snapshot_after(current: &CurrentState, mode: PackageExecutorMode) -> P
     match mode {
         PackageExecutorMode::Record => PackageSnapshot::from_names(current.pacman_packages.clone()),
         PackageExecutorMode::Host => read_installed_package_snapshot(),
+    }
+}
+
+fn service_snapshot_after(
+    current: &CurrentState,
+    mode: ServiceExecutorMode,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    match mode {
+        ServiceExecutorMode::Record => Ok(current.enabled_services.clone()),
+        ServiceExecutorMode::Host => Ok(HostStateReader.read_current_state()?.enabled_services),
     }
 }
 
