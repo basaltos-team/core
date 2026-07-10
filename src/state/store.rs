@@ -152,6 +152,14 @@ impl RunRecord {
         Self::new("apply", config_path, actions, current)
     }
 
+    pub fn apply_failed(
+        config_path: PathBuf,
+        actions: Vec<Action>,
+        current: &CurrentState,
+    ) -> Self {
+        Self::new("apply-failed", config_path, actions, current)
+    }
+
     fn new(mode: &str, config_path: PathBuf, actions: Vec<Action>, current: &CurrentState) -> Self {
         Self {
             id: new_run_id(),
@@ -388,6 +396,18 @@ mod tests {
 
         assert!(json.contains("\"mode\": \"apply\""));
         assert!(json.contains("\"action_count\": 1"));
+    }
+
+    #[test]
+    fn renders_apply_failed_run_record_json() {
+        let record = RunRecord::apply_failed(
+            PathBuf::from("../configs/fixtures/invalid-pacman-missing-package"),
+            Vec::new(),
+            &CurrentState::default(),
+        );
+        let json = render_run_record_json(&record);
+
+        assert!(json.contains("\"mode\": \"apply-failed\""));
     }
 
     #[test]

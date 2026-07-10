@@ -5,7 +5,7 @@ use crate::backends::nix::resolve_nix_install_transaction;
 use crate::backends::pacman::{
     preflight_pacman_install, read_installed_package_snapshot, resolve_pacman_install_transaction,
     write_package_operations_log, HostPackageExecutor, PackageBackend, PackageExecutor,
-    PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
+    PackageResolutionStatus, PackageSnapshot, PackageTransaction, RecordingPackageExecutor,
 };
 use crate::config::BasaltConfig;
 use crate::planning::action::{plan_actions, Action};
@@ -149,6 +149,21 @@ pub fn apply_supported_config(
     }
 
     let lock = acquire_apply_lock(state_dir, "apply")?;
+    let preflight_transactions = resolve_package_transactions_for_actions(&actions)?;
+    if let Err(err) = validate_host_package_preflight(package_executor, &preflight_transactions) {
+        let (run_path, latest_path) = write_failed_apply_record(
+            state_dir,
+            config_dir,
+            config,
+            actions,
+            current,
+            preflight_transactions,
+        )?;
+        let _ = (lock.path(), run_path, latest_path);
+        drop(lock);
+        return Err(err);
+    }
+
     let backup_dir = state_dir
         .join("backups")
         .join(format!("apply-{}", millis_since_epoch()));
@@ -224,7 +239,6 @@ pub fn apply_supported_config(
 
     let package_operations_path = apply_package_operations(state_dir, &actions, package_executor)?;
     let pacman_snapshot_after = pacman_snapshot_after(current, package_executor);
-    let transactions = resolve_package_transactions_for_actions(&actions)?;
     let service_operations_path = apply_service_operations(state_dir, &actions, service_executor)?;
     let enabled_services_after = service_snapshot_after(current, service_executor)?;
 
@@ -247,9 +261,9 @@ pub fn apply_supported_config(
             pacman_snapshot_after: Some(pacman_snapshot_after),
             enabled_services_before: Some(current.enabled_services.clone()),
             enabled_services_after: Some(enabled_services_after),
-            pacman_transaction: Some(transactions.pacman),
-            aur_transaction: Some(transactions.aur),
-            nix_transaction: Some(transactions.nix),
+            pacman_transaction: Some(preflight_transactions.pacman),
+            aur_transaction: Some(preflight_transactions.aur),
+            nix_transaction: Some(preflight_transactions.nix),
         },
     )?;
     let _ = lock.path();
@@ -264,6 +278,41 @@ pub fn apply_supported_config(
         run_path,
         latest_path,
     })
+}
+
+fn write_failed_apply_record(
+    state_dir: &Path,
+    config_dir: PathBuf,
+    config: &BasaltConfig,
+    actions: Vec<Action>,
+    current: &CurrentState,
+    transactions: PackageTransactions,
+) -> Result<(PathBuf, PathBuf), String> {
+    let record = RunRecord::apply_failed(config_dir, actions, current);
+    let (run_path, latest_path) = write_run_record(state_dir, &record)?;
+    index_run(
+        state_dir,
+        &record,
+        &StateDbArtifacts {
+            run_json_path: run_path.clone(),
+            latest_json_path: latest_path.clone(),
+            package_intent: package_intent_from_config(config),
+            service_intent: service_intent_from_config(config),
+            pacman_snapshot_before: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
+            pacman_snapshot_after: Some(PackageSnapshot::from_names(
+                current.pacman_packages.clone(),
+            )),
+            enabled_services_before: Some(current.enabled_services.clone()),
+            enabled_services_after: Some(current.enabled_services.clone()),
+            pacman_transaction: Some(transactions.pacman),
+            aur_transaction: Some(transactions.aur),
+            nix_transaction: Some(transactions.nix),
+            ..StateDbArtifacts::default()
+        },
+    )?;
+    Ok((run_path, latest_path))
 }
 
 fn package_intent_from_config(config: &BasaltConfig) -> Vec<PackageIntent> {
@@ -317,6 +366,24 @@ fn resolve_package_transactions_for_actions(
         aur: resolve_aur_install_transaction(&packages_for_backend(actions, "packages.aur."))?,
         nix: resolve_nix_install_transaction(&packages_for_backend(actions, "packages.nix."))?,
     })
+}
+
+fn validate_host_package_preflight(
+    mode: PackageExecutorMode,
+    transactions: &PackageTransactions,
+) -> Result<(), String> {
+    if mode != PackageExecutorMode::Host {
+        return Ok(());
+    }
+
+    match transactions.pacman.status {
+        PackageResolutionStatus::Resolved | PackageResolutionStatus::Skipped => Ok(()),
+        PackageResolutionStatus::Unavailable | PackageResolutionStatus::Failed => Err(transactions
+            .pacman
+            .message
+            .clone()
+            .unwrap_or_else(|| "pacman transaction preflight failed".to_string())),
+    }
 }
 
 fn packages_for_backend(actions: &[Action], prefix: &str) -> Vec<String> {
@@ -843,6 +910,74 @@ mod tests {
 
         assert!(err.contains("not implemented yet"));
         assert!(err.contains("AUR and Nix"));
+    }
+
+    #[test]
+    fn writes_failed_apply_record_for_package_preflight() {
+        let base = std::env::temp_dir().join(format!(
+            "basalt-package-preflight-failed-test-{}",
+            millis_since_epoch()
+        ));
+        let state = base.join("state");
+        let config = BasaltConfig {
+            packages: Some(crate::config::types::PackagesConfig {
+                pacman: vec!["sl".to_string(), "basalt-missing".to_string()],
+                aur: Vec::new(),
+                nix: Vec::new(),
+            }),
+            services: Some(crate::config::types::ServicesConfig::default()),
+            ..BasaltConfig::default()
+        };
+        let actions = vec![
+            Action {
+                id: "packages.pacman.sl".to_string(),
+                domain: "packages".to_string(),
+                description: "ensure pacman package `sl` is installed".to_string(),
+                risk: crate::planning::action::Risk::High,
+            },
+            Action {
+                id: "packages.pacman.basalt-missing".to_string(),
+                domain: "packages".to_string(),
+                description: "ensure pacman package `basalt-missing` is installed".to_string(),
+                risk: crate::planning::action::Risk::High,
+            },
+        ];
+
+        let (run_path, latest_path) = write_failed_apply_record(
+            &state,
+            PathBuf::from("config"),
+            &config,
+            actions,
+            &CurrentState::default(),
+            PackageTransactions {
+                pacman: PackageTransaction::failed(
+                    "pacman transaction resolution failed (missing package): target not found",
+                ),
+                aur: PackageTransaction::skipped("no AUR packages requested"),
+                nix: PackageTransaction::skipped("no Nix packages requested"),
+            },
+        )
+        .unwrap();
+
+        assert!(run_path.exists());
+        assert!(latest_path.exists());
+        let inspection = crate::state::db::inspect_run(&state, None).unwrap();
+        assert_eq!(
+            inspection.declared_packages,
+            vec![
+                "packages.pacman.sl".to_string(),
+                "packages.pacman.basalt-missing".to_string()
+            ]
+        );
+        assert!(inspection
+            .package_transaction_statuses
+            .iter()
+            .any(|status| status.contains("pacman: failed") && status.contains("missing package")));
+
+        let rows = crate::state::db::history_rows(&state, 10).unwrap();
+        assert_eq!(rows[0].mode, "apply-failed");
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
