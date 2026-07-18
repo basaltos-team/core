@@ -19,6 +19,16 @@ Rust implementation repository for the BasaltOS control plane.
 - Published pacman repository metadata. That lives in `repo-manifests/`.
 - Long-form user docs. Those live in `docs/`.
 
+## Validation
+
+Run the local core gate with:
+
+```sh
+cargo test
+```
+
+From the full workspace, `./tests/scripts/check-local` also covers fake-root apply behavior.
+
 ## Planned Layout
 
 ```text
