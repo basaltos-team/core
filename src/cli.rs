@@ -1,6 +1,6 @@
 // Command definitions shared with docs, shell completions, and tests.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::state::store::{
     read_configured_managed_files, CurrentState, HostStateReader, StateReader,
@@ -265,6 +265,15 @@ pub fn run(args: Vec<String>) -> i32 {
                 1
             }
         },
+        Ok(Command::Doctor) => {
+            let report = doctor_report();
+            print!("{}", render_doctor_report(&report));
+            if report.iter().any(|check| check.required && !check.present) {
+                1
+            } else {
+                0
+            }
+        }
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -358,6 +367,7 @@ enum Command {
         service: String,
         limit: usize,
     },
+    Doctor,
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -380,6 +390,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "inspect-run" => parse_inspect_run(args),
         "package-history" => parse_package_history(args),
         "service-history" => parse_service_history(args),
+        "doctor" => parse_doctor(args),
         "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
@@ -698,6 +709,13 @@ fn parse_service_history(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_doctor(args: &[String]) -> Result<Command, String> {
+    if args.len() > 2 {
+        return Err(format!("unexpected argument `{}`", args[2]));
+    }
+    Ok(Command::Doctor)
+}
+
 fn parse_restore(args: &[String]) -> Result<Command, String> {
     let mut backup_dir = None;
     let mut root_dir = None;
@@ -746,6 +764,7 @@ fn print_help() {
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
     println!("  basalt package-history --package <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt service-history --service <name> [--state-dir <path>] [--limit <n>]");
+    println!("  basalt doctor");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }
@@ -760,5 +779,138 @@ fn read_apply_current_state(
         Ok(current)
     } else {
         TargetRootStateReader::new(root_dir, config).read_current_state()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorCheck {
+    name: &'static str,
+    required: bool,
+    present: bool,
+    detail: String,
+}
+
+fn doctor_report() -> Vec<DoctorCheck> {
+    [
+        ("cargo", true, "required for local Rust builds and tests"),
+        ("rustc", true, "required for local Rust builds and tests"),
+        ("git", true, "required for multi-repo development"),
+        ("pacman", false, "required for host package apply on Arch"),
+        ("systemctl", false, "required for host service apply"),
+        ("qemu-system-x86_64", false, "required for VM smoke tests"),
+        ("ssh", false, "required for VM smoke tests"),
+    ]
+    .into_iter()
+    .map(
+        |(name, required, detail)| match find_command_on_path(name) {
+            Some(path) => DoctorCheck {
+                name,
+                required,
+                present: true,
+                detail: path.display().to_string(),
+            },
+            None => DoctorCheck {
+                name,
+                required,
+                present: false,
+                detail: detail.to_string(),
+            },
+        },
+    )
+    .collect()
+}
+
+fn render_doctor_report(checks: &[DoctorCheck]) -> String {
+    let mut output = String::from("Basalt doctor\n\nRequired tools:\n");
+    for check in checks.iter().filter(|check| check.required) {
+        output.push_str(&render_doctor_check(check));
+    }
+    output.push_str("\nOptional tools:\n");
+    for check in checks.iter().filter(|check| !check.required) {
+        output.push_str(&render_doctor_check(check));
+    }
+
+    if checks.iter().any(|check| check.required && !check.present) {
+        output.push_str("\nStatus: missing required tools\n");
+    } else {
+        output.push_str("\nStatus: ok\n");
+    }
+    output
+}
+
+fn render_doctor_check(check: &DoctorCheck) -> String {
+    if check.present {
+        format!("- {}: ok ({})\n", check.name, check.detail)
+    } else {
+        format!("- {}: missing ({})\n", check.name, check.detail)
+    }
+}
+
+fn find_command_on_path(command: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|path| path.join(command))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn renders_doctor_success_when_required_tools_exist() {
+        let report = vec![
+            DoctorCheck {
+                name: "cargo",
+                required: true,
+                present: true,
+                detail: "/bin/cargo".to_string(),
+            },
+            DoctorCheck {
+                name: "pacman",
+                required: false,
+                present: false,
+                detail: "required for host package apply on Arch".to_string(),
+            },
+        ];
+
+        let rendered = render_doctor_report(&report);
+        assert!(rendered.contains("- cargo: ok (/bin/cargo)"));
+        assert!(rendered.contains("- pacman: missing"));
+        assert!(rendered.contains("Status: ok"));
+    }
+
+    #[test]
+    fn renders_doctor_failure_when_required_tool_is_missing() {
+        let report = vec![DoctorCheck {
+            name: "cargo",
+            required: true,
+            present: false,
+            detail: "required for local Rust builds and tests".to_string(),
+        }];
+
+        let rendered = render_doctor_report(&report);
+        assert!(rendered.contains("- cargo: missing"));
+        assert!(rendered.contains("Status: missing required tools"));
     }
 }

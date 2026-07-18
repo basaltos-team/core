@@ -69,3 +69,11 @@ Implement:
 ```sh
 basalt validate --config ../configs/examples/minimal
 ```
+
+## Useful Commands
+
+```sh
+basalt doctor
+```
+
+`doctor` is read-only and reports whether local development, host apply, and VM smoke prerequisites are available.
