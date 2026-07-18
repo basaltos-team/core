@@ -10,5 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: core
+      - uses: actions/checkout@v4
+        with:
+          repository: basaltos-team/configs
+          path: configs
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
+        working-directory: core
