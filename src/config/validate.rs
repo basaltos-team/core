@@ -52,6 +52,47 @@ pub fn validate(config: &BasaltConfig) -> Vec<String> {
         }
     }
 
+    if let Some(workspaces) = &config.workspaces {
+        for (name, workspace) in &workspaces.entries {
+            if !is_valid_identifier(name) {
+                errors.push(format!(
+                    "`workspaces` name `{name}` must contain only letters, numbers, `_`, or `-`"
+                ));
+            }
+            if workspace.path.trim().is_empty() {
+                errors.push(format!("`workspaces.{name}.path` cannot be empty"));
+            }
+            if workspace.backend != "devenv" {
+                errors.push(format!(
+                    "`workspaces.{name}.backend` unsupported backend `{}`",
+                    workspace.backend
+                ));
+            }
+            validate_workspace_keys(
+                &format!("workspaces.{name}.languages"),
+                &workspace.languages,
+                &mut errors,
+            );
+            validate_workspace_keys(
+                &format!("workspaces.{name}.services"),
+                &workspace.services,
+                &mut errors,
+            );
+            validate_workspace_package_attrs(
+                &format!("workspaces.{name}.packages"),
+                &workspace.packages,
+                &mut errors,
+            );
+            for task in workspace.tasks.keys() {
+                if task.trim().is_empty() {
+                    errors.push(format!(
+                        "`workspaces.{name}.tasks` task names cannot be empty"
+                    ));
+                }
+            }
+        }
+    }
+
     errors
 }
 
@@ -70,6 +111,37 @@ fn validate_package_names(path: &str, packages: &[String], errors: &mut Vec<Stri
         if package.contains(['=', '<', '>']) {
             errors.push(format!(
                 "`{path}` package `{package}` uses unsupported version constraint syntax"
+            ));
+        }
+    }
+}
+
+fn validate_workspace_keys(
+    path: &str,
+    values: &std::collections::BTreeMap<String, bool>,
+    errors: &mut Vec<String>,
+) {
+    for key in values.keys() {
+        if !is_valid_identifier(key) {
+            errors.push(format!(
+                "`{path}` key `{key}` must contain only letters, numbers, `_`, or `-`"
+            ));
+        }
+    }
+}
+
+fn is_valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn validate_workspace_package_attrs(path: &str, packages: &[String], errors: &mut Vec<String>) {
+    for package in packages {
+        if package.split('.').any(|part| !is_valid_identifier(part)) {
+            errors.push(format!(
+                "`{path}` package `{package}` must be a Nix attr path using letters, numbers, `_`, `-`, or `.`"
             ));
         }
     }
@@ -96,6 +168,7 @@ mod tests {
             }),
             services: Some(ServicesConfig::default()),
             files: None,
+            workspaces: None,
         };
 
         let errors = validate(&config);
@@ -103,5 +176,36 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("unsupported version constraint syntax")));
+    }
+
+    #[test]
+    fn rejects_unsupported_workspace_backend() {
+        let config = BasaltConfig {
+            system: Some(SystemConfig {
+                hostname: "basalt-test".to_string(),
+                timezone: None,
+                locale: None,
+                keymap: None,
+            }),
+            packages: Some(PackagesConfig::default()),
+            services: Some(ServicesConfig::default()),
+            files: None,
+            workspaces: Some(crate::config::types::WorkspacesConfig {
+                entries: std::collections::BTreeMap::from([(
+                    "core".to_string(),
+                    crate::config::types::WorkspaceConfig {
+                        path: "~/Projects/basaltos/core".to_string(),
+                        backend: "profile".to_string(),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+        };
+
+        let errors = validate(&config);
+
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsupported backend `profile`")));
     }
 }

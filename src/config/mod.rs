@@ -125,7 +125,7 @@ fn parse_config_source(path: &Path, input: &str) -> Result<BTreeMap<String, Doma
                 domains.insert(domain, value);
             }
         }
-        DomainValue::String(_) | DomainValue::List(_) => {
+        DomainValue::Boolean(_) | DomainValue::String(_) | DomainValue::List(_) => {
             return Err(format!(
                 "{}: config file must return a table",
                 path.display()
@@ -151,10 +151,11 @@ fn lua_value_to_domain_value(
                     path.display()
                 )
             }),
+        Value::Boolean(value) => Ok(DomainValue::Boolean(value)),
         Value::Table(table) => lua_table_to_domain_value(path, lua_path, table),
         Value::Nil => Err(format!("{}: `{lua_path}` is nil", path.display())),
         _ => Err(format!(
-            "{}: `{lua_path}` must be a string, list, or table",
+            "{}: `{lua_path}` must be a boolean, string, list, or table",
             path.display()
         )),
     }
@@ -286,6 +287,26 @@ mod tests {
         );
         assert_eq!(config.package_count(), 5);
         assert_eq!(config.service_count(), 2);
+    }
+
+    #[test]
+    fn validates_devenv_workspace_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-devenv-workspace");
+
+        let config = validate_config_dir(&root).unwrap();
+        assert_eq!(config.workspace_count(), 1);
+        let workspaces = config.workspaces.as_ref().unwrap();
+        let workspace = workspaces.entries.get("basalt_core").unwrap();
+        assert_eq!(workspace.backend, "devenv");
+        assert_eq!(workspace.languages.get("rust"), Some(&true));
+        assert_eq!(workspace.services.get("postgres"), Some(&true));
+        assert_eq!(
+            workspace.tasks.get("test").map(String::as_str),
+            Some("cargo test")
+        );
     }
 
     #[test]

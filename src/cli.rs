@@ -13,10 +13,11 @@ pub fn run(args: Vec<String>) -> i32 {
             match crate::config::validate_config_dir(&config_dir) {
                 Ok(config) => {
                     println!(
-                    "Basalt config valid: {} domain(s), {} package declaration(s), {} enabled service(s)",
+                    "Basalt config valid: {} domain(s), {} package declaration(s), {} enabled service(s), {} workspace(s)",
                     config.domain_count(),
                     config.package_count(),
-                    config.service_count()
+                    config.service_count(),
+                    config.workspace_count()
                 );
                     0
                 }
@@ -274,6 +275,45 @@ pub fn run(args: Vec<String>) -> i32 {
                 0
             }
         }
+        Ok(Command::WorkspaceGenerate {
+            config_dir,
+            output_dir,
+        }) => match crate::config::validate_config_dir(&config_dir) {
+            Ok(config) => match crate::workspaces::generate_workspace_artifacts(
+                config.workspaces.as_ref(),
+                &output_dir,
+            ) {
+                Ok(artifacts) => {
+                    println!("Basalt workspace generate");
+                    println!();
+                    if artifacts.is_empty() {
+                        println!("Generated workspaces: none");
+                    } else {
+                        println!("Generated workspaces:");
+                        for artifact in artifacts {
+                            println!(
+                                "- {}: {} -> {}",
+                                artifact.name,
+                                artifact.workspace_path,
+                                artifact.devenv_nix.display()
+                            );
+                        }
+                    }
+                    0
+                }
+                Err(err) => {
+                    eprintln!("workspace generation failed: {err}");
+                    1
+                }
+            },
+            Err(errs) => {
+                eprintln!("Basalt config invalid:");
+                for err in errs {
+                    eprintln!("- {err}");
+                }
+                1
+            }
+        },
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -368,6 +408,10 @@ enum Command {
         limit: usize,
     },
     Doctor,
+    WorkspaceGenerate {
+        config_dir: PathBuf,
+        output_dir: PathBuf,
+    },
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -391,10 +435,55 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "package-history" => parse_package_history(args),
         "service-history" => parse_service_history(args),
         "doctor" => parse_doctor(args),
+        "workspace" => parse_workspace(args),
         "restore" => parse_restore(args),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command `{other}`")),
     }
+}
+
+fn parse_workspace(args: &[String]) -> Result<Command, String> {
+    let Some(subcommand) = args.get(2).map(String::as_str) else {
+        return Err("workspace requires subcommand `generate`".to_string());
+    };
+    match subcommand {
+        "generate" => parse_workspace_generate(args),
+        other => Err(format!("unknown workspace subcommand `{other}`")),
+    }
+}
+
+fn parse_workspace_generate(args: &[String]) -> Result<Command, String> {
+    let mut config_dir = None;
+    let mut output_dir = None;
+    let mut i = 3;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--config` requires a directory path".to_string())?;
+                config_dir = Some(PathBuf::from(value));
+            }
+            "--output" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--output` requires a directory path".to_string())?;
+                output_dir = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::WorkspaceGenerate {
+        config_dir: config_dir
+            .ok_or_else(|| "`workspace generate` requires `--config <path>`".to_string())?,
+        output_dir: output_dir
+            .ok_or_else(|| "`workspace generate` requires `--output <path>`".to_string())?,
+    })
 }
 
 fn parse_validate(args: &[String]) -> Result<Command, String> {
@@ -765,6 +854,7 @@ fn print_help() {
     println!("  basalt package-history --package <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt service-history --service <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt doctor");
+    println!("  basalt workspace generate --config <path> --output <path>");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
 }

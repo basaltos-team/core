@@ -5,6 +5,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainValue {
+    Boolean(bool),
     String(String),
     List(Vec<DomainValue>),
     Table(Vec<(String, DomainValue)>),
@@ -18,10 +19,9 @@ impl DomainValue {
     ) -> Result<BTreeMap<String, DomainValue>, String> {
         match self {
             DomainValue::Table(entries) => Ok(entries.into_iter().collect()),
-            DomainValue::String(_) | DomainValue::List(_) => Err(format!(
-                "{}: domain `{domain}` must be a table",
-                file.display()
-            )),
+            DomainValue::Boolean(_) | DomainValue::String(_) | DomainValue::List(_) => Err(
+                format!("{}: domain `{domain}` must be a table", file.display()),
+            ),
         }
     }
 }
@@ -32,6 +32,7 @@ pub struct BasaltConfig {
     pub packages: Option<PackagesConfig>,
     pub services: Option<ServicesConfig>,
     pub files: Option<FilesConfig>,
+    pub workspaces: Option<WorkspacesConfig>,
 }
 
 impl BasaltConfig {
@@ -41,6 +42,7 @@ impl BasaltConfig {
             "packages" => self.packages.is_some(),
             "services" => self.services.is_some(),
             "files" => self.files.is_some(),
+            "workspaces" => self.workspaces.is_some(),
             _ => false,
         }
     }
@@ -68,6 +70,10 @@ impl BasaltConfig {
                 self.files = Some(FilesConfig::from_value(value, file)?);
                 Ok(())
             }
+            "workspaces" => {
+                self.workspaces = Some(WorkspacesConfig::from_value(value, file)?);
+                Ok(())
+            }
             other => Err(format!(
                 "{}: unknown top-level domain `{other}`",
                 file.display()
@@ -83,6 +89,7 @@ impl BasaltConfig {
             + self.packages.iter().count()
             + self.services.iter().count()
             + self.files.iter().count()
+            + self.workspaces.iter().count()
     }
 
     pub fn package_count(&self) -> usize {
@@ -99,6 +106,13 @@ impl BasaltConfig {
                 let _ = services.disable.len();
                 services.enable.len()
             })
+            .unwrap_or(0)
+    }
+
+    pub fn workspace_count(&self) -> usize {
+        self.workspaces
+            .as_ref()
+            .map(|workspaces| workspaces.entries.len())
             .unwrap_or(0)
     }
 }
@@ -124,6 +138,69 @@ pub struct ManagedFileConfig {
     pub path: String,
     pub content: String,
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkspacesConfig {
+    pub entries: BTreeMap<String, WorkspaceConfig>,
+}
+
+impl WorkspacesConfig {
+    fn from_value(value: DomainValue, file: &Path) -> Result<Self, String> {
+        let entries = value.into_table(file, "workspaces")?;
+        let mut workspaces = BTreeMap::new();
+
+        for (name, value) in entries {
+            workspaces.insert(
+                name.clone(),
+                WorkspaceConfig::from_value(value, file, &name)?,
+            );
+        }
+
+        Ok(Self {
+            entries: workspaces,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceConfig {
+    pub path: String,
+    pub backend: String,
+    pub languages: BTreeMap<String, bool>,
+    pub packages: Vec<String>,
+    pub services: BTreeMap<String, bool>,
+    pub tasks: BTreeMap<String, String>,
+}
+
+impl WorkspaceConfig {
+    fn from_value(value: DomainValue, file: &Path, name: &str) -> Result<Self, String> {
+        let domain = format!("workspaces.{name}");
+        let mut fields = value.into_table(file, &domain)?;
+        reject_unknown_fields(
+            file,
+            &domain,
+            &fields,
+            &[
+                "path",
+                "backend",
+                "languages",
+                "packages",
+                "services",
+                "tasks",
+            ],
+        )?;
+
+        Ok(Self {
+            path: take_required_string(file, &format!("{domain}.path"), &mut fields)?,
+            backend: take_optional_string(file, &format!("{domain}.backend"), &mut fields)?
+                .unwrap_or_else(|| "devenv".to_string()),
+            languages: take_optional_bool_map(file, &format!("{domain}.languages"), &mut fields)?,
+            packages: take_optional_list(file, &format!("{domain}.packages"), &mut fields)?,
+            services: take_optional_bool_map(file, &format!("{domain}.services"), &mut fields)?,
+            tasks: take_optional_string_map(file, &format!("{domain}.tasks"), &mut fields)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -250,10 +327,9 @@ fn take_optional_list(
             .into_iter()
             .map(|value| match value {
                 DomainValue::String(value) => Ok(value),
-                DomainValue::List(_) | DomainValue::Table(_) => Err(format!(
-                    "{}: `{path}` must be a list of strings",
-                    file.display()
-                )),
+                DomainValue::Boolean(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
+                    format!("{}: `{path}` must be a list of strings", file.display()),
+                ),
             })
             .collect(),
         Some(_) => Err(format!(
@@ -261,6 +337,46 @@ fn take_optional_list(
             file.display()
         )),
         None => Ok(Vec::new()),
+    }
+}
+
+fn take_optional_bool_map(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<BTreeMap<String, bool>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::Table(values)) => values
+            .into_iter()
+            .map(|(key, value)| match value {
+                DomainValue::Boolean(value) => Ok((key, value)),
+                DomainValue::String(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
+                    format!("{}: `{path}.{key}` must be a boolean", file.display()),
+                ),
+            })
+            .collect(),
+        Some(_) => Err(format!("{}: `{path}` must be a table", file.display())),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+fn take_optional_string_map(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<BTreeMap<String, String>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::Table(values)) => values
+            .into_iter()
+            .map(|(key, value)| match value {
+                DomainValue::String(value) => Ok((key, value)),
+                DomainValue::Boolean(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
+                    format!("{}: `{path}.{key}` must be a string", file.display()),
+                ),
+            })
+            .collect(),
+        Some(_) => Err(format!("{}: `{path}` must be a table", file.display())),
+        None => Ok(BTreeMap::new()),
     }
 }
 

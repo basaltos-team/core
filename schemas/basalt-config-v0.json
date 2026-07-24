@@ -89,6 +89,42 @@
           "required": false
         }
       ]
+    },
+    {
+      "name": "workspaces",
+      "ownership": "owns generated developer workspace environment intent",
+      "fields": [
+        {
+          "path": "workspaces.<name>.path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "path": "workspaces.<name>.backend",
+          "type": "string",
+          "required": false
+        },
+        {
+          "path": "workspaces.<name>.languages",
+          "type": "table<boolean>",
+          "required": false
+        },
+        {
+          "path": "workspaces.<name>.packages",
+          "type": "list<string>",
+          "required": false
+        },
+        {
+          "path": "workspaces.<name>.services",
+          "type": "table<boolean>",
+          "required": false
+        },
+        {
+          "path": "workspaces.<name>.tasks",
+          "type": "table<string>",
+          "required": false
+        }
+      ]
     }
   ]
 }

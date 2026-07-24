@@ -109,6 +109,42 @@ const DOMAINS: &[DomainSchema] = &[
             },
         ],
     },
+    DomainSchema {
+        name: "workspaces",
+        ownership: "owns generated developer workspace environment intent",
+        fields: &[
+            FieldSchema {
+                path: "workspaces.<name>.path",
+                required: true,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "workspaces.<name>.backend",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "workspaces.<name>.languages",
+                required: false,
+                field_type: "table<boolean>",
+            },
+            FieldSchema {
+                path: "workspaces.<name>.packages",
+                required: false,
+                field_type: "list<string>",
+            },
+            FieldSchema {
+                path: "workspaces.<name>.services",
+                required: false,
+                field_type: "table<boolean>",
+            },
+            FieldSchema {
+                path: "workspaces.<name>.tasks",
+                required: false,
+                field_type: "table<string>",
+            },
+        ],
+    },
 ];
 
 pub fn generate_schema_artifacts(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -214,5 +250,6 @@ mod tests {
         assert!(markdown.contains("# Basalt Config Schema v0"));
         assert!(markdown.contains("| `services.disable` | `list<string>` | no |"));
         assert!(markdown.contains("| `files.managed[].content` | `string` | yes |"));
+        assert!(markdown.contains("| `workspaces.<name>.path` | `string` | yes |"));
     }
 }

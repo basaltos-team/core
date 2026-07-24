@@ -86,3 +86,9 @@ basalt doctor
 ```
 
 `doctor` is read-only and reports whether local development, host apply, and VM smoke prerequisites are available.
+
+```sh
+basalt workspace generate --config ../configs/fixtures/valid-devenv-workspace --output ./target/workspace-generate-smoke
+```
+
+`workspace generate` is generation-only. It validates the config and writes devenv artifacts under the output directory without running Nix or mutating profiles.

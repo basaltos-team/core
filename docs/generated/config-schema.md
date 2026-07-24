@@ -8,6 +8,7 @@ Generated from the Basalt implementation.
 - `packages`: owns package desired state intent
 - `services`: owns service desired state intent
 - `files`: owns managed file desired state intent
+- `workspaces`: owns generated developer workspace environment intent
 
 ## Fields
 
@@ -26,6 +27,12 @@ Generated from the Basalt implementation.
 | `files.managed[].path` | `string` | yes |
 | `files.managed[].content` | `string` | yes |
 | `files.managed[].mode` | `string` | no |
+| `workspaces.<name>.path` | `string` | yes |
+| `workspaces.<name>.backend` | `string` | no |
+| `workspaces.<name>.languages` | `table<boolean>` | no |
+| `workspaces.<name>.packages` | `list<string>` | no |
+| `workspaces.<name>.services` | `table<boolean>` | no |
+| `workspaces.<name>.tasks` | `table<string>` | no |
 
 ## Ownership Notes
 
@@ -33,3 +40,4 @@ Generated from the Basalt implementation.
 - `packages` owns package desired state intent.
 - `services` owns service desired state intent.
 - `files` owns managed file desired state intent.
+- `workspaces` owns generated developer workspace environment intent.
