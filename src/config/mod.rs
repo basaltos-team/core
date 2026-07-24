@@ -32,7 +32,7 @@ pub fn validate_config_dir(path: &Path) -> Result<BasaltConfig, Vec<String>> {
         )]);
     }
 
-    let files = match lua_files(path) {
+    let files = match config_entry_files(path) {
         Ok(files) => files,
         Err(err) => return Err(vec![err]),
     };
@@ -76,7 +76,12 @@ pub fn validate_config_dir(path: &Path) -> Result<BasaltConfig, Vec<String>> {
     }
 }
 
-fn lua_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+fn config_entry_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let init = path.join("init.lua");
+    if init.is_file() {
+        return Ok(vec![init]);
+    }
+
     let mut files = Vec::new();
 
     for entry in fs::read_dir(path).map_err(|err| format!("{}: {err}", path.display()))? {
@@ -97,14 +102,12 @@ fn parse_config_file(path: &Path) -> Result<BTreeMap<String, DomainValue>, Strin
 }
 
 fn parse_config_source(path: &Path, input: &str) -> Result<BTreeMap<String, DomainValue>, String> {
-    if !input.trim_start().starts_with("return") {
-        return Err(format!(
-            "{}: config file must return a table",
-            path.display()
-        ));
-    }
-
-    let lua = sandbox::new_sandboxed_lua(path)?;
+    let lua = if path.file_name().is_some_and(|name| name == "init.lua") {
+        let module_root = path.parent().unwrap_or_else(|| Path::new("."));
+        sandbox::new_sandboxed_lua_with_modules(path, module_root)?
+    } else {
+        sandbox::new_sandboxed_lua(path)?
+    };
     let value = lua
         .load(input)
         .set_name(path.display().to_string())
@@ -249,7 +252,7 @@ mod tests {
 
     #[test]
     fn rejects_non_returning_file() {
-        let input = r#"{ system = { hostname = "basalt-vm" } }"#;
+        let input = r#"local hostname = "basalt-vm""#;
         assert!(parse_config_source(Path::new("system.lua"), input).is_err());
     }
 
@@ -264,6 +267,25 @@ mod tests {
         assert_eq!(config.domain_count(), 3);
         assert_eq!(config.package_count(), 2);
         assert_eq!(config.service_count(), 1);
+    }
+
+    #[test]
+    fn validates_composed_init_fixture() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/valid-composed");
+
+        let config = validate_config_dir(&root).unwrap();
+        assert_eq!(
+            config
+                .system
+                .as_ref()
+                .map(|system| system.hostname.as_str()),
+            Some("basalt-composed")
+        );
+        assert_eq!(config.package_count(), 5);
+        assert_eq!(config.service_count(), 2);
     }
 
     #[test]
@@ -304,6 +326,19 @@ mod tests {
             err.contains("Lua evaluation failed")
                 && (err.contains("os") || err.contains("nil value"))
         }));
+    }
+
+    #[test]
+    fn rejects_module_escape_from_init() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("configs/fixtures/invalid-module-escape");
+
+        let errors = validate_config_dir(&root).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|err| err.contains("unsupported module name")));
     }
 
     #[test]

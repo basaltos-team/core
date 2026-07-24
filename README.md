@@ -29,6 +29,15 @@ cargo test
 
 From the full workspace, `./tests/scripts/check-local` also covers fake-root apply behavior.
 
+## Config Loading
+
+Basalt config directories support two shapes:
+
+- `init.lua` entrypoint mode: when `init.lua` exists, Basalt evaluates only that file as the config entrypoint. The entrypoint may use the sandboxed `require("path.to.module")` helper to import other `.lua` files below the same config directory.
+- legacy merge mode: when no `init.lua` exists, Basalt evaluates each top-level `*.lua` file and merges the returned top-level domains.
+
+The sandboxed module loader is intentionally local to the config directory. It does not expose Lua `io`, `os`, `package`, `loadfile`, or `dofile`.
+
 ## Planned Layout
 
 ```text
