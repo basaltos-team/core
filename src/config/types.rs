@@ -6,6 +6,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainValue {
     Boolean(bool),
+    Integer(i64),
     String(String),
     List(Vec<DomainValue>),
     Table(Vec<(String, DomainValue)>),
@@ -19,9 +20,13 @@ impl DomainValue {
     ) -> Result<BTreeMap<String, DomainValue>, String> {
         match self {
             DomainValue::Table(entries) => Ok(entries.into_iter().collect()),
-            DomainValue::Boolean(_) | DomainValue::String(_) | DomainValue::List(_) => Err(
-                format!("{}: domain `{domain}` must be a table", file.display()),
-            ),
+            DomainValue::Boolean(_)
+            | DomainValue::Integer(_)
+            | DomainValue::String(_)
+            | DomainValue::List(_) => Err(format!(
+                "{}: domain `{domain}` must be a table",
+                file.display()
+            )),
         }
     }
 }
@@ -31,6 +36,7 @@ pub struct BasaltConfig {
     pub system: Option<SystemConfig>,
     pub packages: Option<PackagesConfig>,
     pub services: Option<ServicesConfig>,
+    pub storage: Option<StorageConfig>,
     pub files: Option<FilesConfig>,
     pub workspaces: Option<WorkspacesConfig>,
 }
@@ -41,6 +47,7 @@ impl BasaltConfig {
             "system" => self.system.is_some(),
             "packages" => self.packages.is_some(),
             "services" => self.services.is_some(),
+            "storage" => self.storage.is_some(),
             "files" => self.files.is_some(),
             "workspaces" => self.workspaces.is_some(),
             _ => false,
@@ -66,6 +73,10 @@ impl BasaltConfig {
                 self.services = Some(ServicesConfig::from_value(value, file)?);
                 Ok(())
             }
+            "storage" => {
+                self.storage = Some(StorageConfig::from_value(value, file)?);
+                Ok(())
+            }
             "files" => {
                 self.files = Some(FilesConfig::from_value(value, file)?);
                 Ok(())
@@ -88,6 +99,7 @@ impl BasaltConfig {
         self.system.iter().count()
             + self.packages.iter().count()
             + self.services.iter().count()
+            + self.storage.iter().count()
             + self.files.iter().count()
             + self.workspaces.iter().count()
     }
@@ -114,6 +126,128 @@ impl BasaltConfig {
             .as_ref()
             .map(|workspaces| workspaces.entries.len())
             .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub layout: String,
+    pub disk: Option<String>,
+    pub target: String,
+    pub efi_filesystem: Option<String>,
+    pub root_filesystem: Option<String>,
+    pub partitions: Vec<StoragePartitionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoragePartitionConfig {
+    pub disk: String,
+    pub number: Option<String>,
+    pub label: Option<String>,
+    pub mountpoint: Option<String>,
+    pub filesystem: String,
+    pub size: Option<String>,
+    pub flags: Vec<String>,
+    pub format: bool,
+    pub mount_options: Vec<String>,
+    pub subvolumes: Vec<StorageSubvolumeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSubvolumeConfig {
+    pub name: String,
+    pub mountpoint: String,
+    pub mount_options: Vec<String>,
+}
+
+impl StorageConfig {
+    fn from_value(value: DomainValue, file: &Path) -> Result<Self, String> {
+        let mut fields = value.into_table(file, "storage")?;
+        reject_unknown_fields(
+            file,
+            "storage",
+            &fields,
+            &[
+                "layout",
+                "disk",
+                "target",
+                "efi_filesystem",
+                "root_filesystem",
+                "partitions",
+            ],
+        )?;
+
+        Ok(Self {
+            layout: take_optional_string(file, "storage.layout", &mut fields)?
+                .unwrap_or_else(|| "whole_disk".to_string()),
+            disk: take_optional_string(file, "storage.disk", &mut fields)?,
+            target: take_optional_string(file, "storage.target", &mut fields)?
+                .unwrap_or_else(|| "/mnt".to_string()),
+            efi_filesystem: take_optional_string(file, "storage.efi_filesystem", &mut fields)?
+                .or_else(|| Some("fat32".to_string())),
+            root_filesystem: take_optional_string(file, "storage.root_filesystem", &mut fields)?
+                .or_else(|| Some("ext4".to_string())),
+            partitions: take_optional_storage_partitions(file, "storage.partitions", &mut fields)?,
+        })
+    }
+}
+
+impl StoragePartitionConfig {
+    fn from_value(value: DomainValue, file: &Path, path: &str) -> Result<Self, String> {
+        let mut fields = value.into_table(file, path)?;
+        reject_unknown_fields(
+            file,
+            path,
+            &fields,
+            &[
+                "disk",
+                "number",
+                "label",
+                "mountpoint",
+                "filesystem",
+                "size",
+                "flags",
+                "format",
+                "mount_options",
+                "subvolumes",
+            ],
+        )?;
+
+        Ok(Self {
+            disk: take_required_string(file, &format!("{path}.disk"), &mut fields)?,
+            number: take_optional_string_or_integer(file, &format!("{path}.number"), &mut fields)?,
+            label: take_optional_string(file, &format!("{path}.label"), &mut fields)?,
+            mountpoint: take_optional_string(file, &format!("{path}.mountpoint"), &mut fields)?,
+            filesystem: take_required_string(file, &format!("{path}.filesystem"), &mut fields)?,
+            size: take_optional_string(file, &format!("{path}.size"), &mut fields)?,
+            flags: take_optional_list(file, &format!("{path}.flags"), &mut fields)?,
+            format: take_optional_bool(file, &format!("{path}.format"), &mut fields)?
+                .unwrap_or(true),
+            mount_options: take_optional_list(file, &format!("{path}.mount_options"), &mut fields)?,
+            subvolumes: take_optional_storage_subvolumes(
+                file,
+                &format!("{path}.subvolumes"),
+                &mut fields,
+            )?,
+        })
+    }
+}
+
+impl StorageSubvolumeConfig {
+    fn from_value(value: DomainValue, file: &Path, path: &str) -> Result<Self, String> {
+        let mut fields = value.into_table(file, path)?;
+        reject_unknown_fields(
+            file,
+            path,
+            &fields,
+            &["name", "mountpoint", "mount_options"],
+        )?;
+
+        Ok(Self {
+            name: take_required_string(file, &format!("{path}.name"), &mut fields)?,
+            mountpoint: take_required_string(file, &format!("{path}.mountpoint"), &mut fields)?,
+            mount_options: take_optional_list(file, &format!("{path}.mount_options"), &mut fields)?,
+        })
     }
 }
 
@@ -317,6 +451,34 @@ fn take_optional_string(
     }
 }
 
+fn take_optional_string_or_integer(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<Option<String>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::String(value)) => Ok(Some(value)),
+        Some(DomainValue::Integer(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(format!(
+            "{}: `{path}` must be a string or integer",
+            file.display()
+        )),
+        None => Ok(None),
+    }
+}
+
+fn take_optional_bool(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<Option<bool>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::Boolean(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{}: `{path}` must be a boolean", file.display())),
+        None => Ok(None),
+    }
+}
+
 fn take_optional_list(
     file: &Path,
     path: &str,
@@ -327,9 +489,13 @@ fn take_optional_list(
             .into_iter()
             .map(|value| match value {
                 DomainValue::String(value) => Ok(value),
-                DomainValue::Boolean(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
-                    format!("{}: `{path}` must be a list of strings", file.display()),
-                ),
+                DomainValue::Boolean(_)
+                | DomainValue::Integer(_)
+                | DomainValue::List(_)
+                | DomainValue::Table(_) => Err(format!(
+                    "{}: `{path}` must be a list of strings",
+                    file.display()
+                )),
             })
             .collect(),
         Some(_) => Err(format!(
@@ -350,9 +516,13 @@ fn take_optional_bool_map(
             .into_iter()
             .map(|(key, value)| match value {
                 DomainValue::Boolean(value) => Ok((key, value)),
-                DomainValue::String(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
-                    format!("{}: `{path}.{key}` must be a boolean", file.display()),
-                ),
+                DomainValue::Integer(_)
+                | DomainValue::String(_)
+                | DomainValue::List(_)
+                | DomainValue::Table(_) => Err(format!(
+                    "{}: `{path}.{key}` must be a boolean",
+                    file.display()
+                )),
             })
             .collect(),
         Some(_) => Err(format!("{}: `{path}` must be a table", file.display())),
@@ -370,9 +540,13 @@ fn take_optional_string_map(
             .into_iter()
             .map(|(key, value)| match value {
                 DomainValue::String(value) => Ok((key, value)),
-                DomainValue::Boolean(_) | DomainValue::List(_) | DomainValue::Table(_) => Err(
-                    format!("{}: `{path}.{key}` must be a string", file.display()),
-                ),
+                DomainValue::Boolean(_)
+                | DomainValue::Integer(_)
+                | DomainValue::List(_)
+                | DomainValue::Table(_) => Err(format!(
+                    "{}: `{path}.{key}` must be a string",
+                    file.display()
+                )),
             })
             .collect(),
         Some(_) => Err(format!("{}: `{path}` must be a table", file.display())),
@@ -393,6 +567,48 @@ fn take_optional_managed_files(
             .collect(),
         Some(_) => Err(format!(
             "{}: `{path}` must be a list of file tables",
+            file.display()
+        )),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn take_optional_storage_partitions(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<Vec<StoragePartitionConfig>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::List(values)) => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                StoragePartitionConfig::from_value(value, file, &format!("{path}[{}]", index + 1))
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "{}: `{path}` must be a list of partition tables",
+            file.display()
+        )),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn take_optional_storage_subvolumes(
+    file: &Path,
+    path: &str,
+    fields: &mut BTreeMap<String, DomainValue>,
+) -> Result<Vec<StorageSubvolumeConfig>, String> {
+    match fields.remove(path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path)) {
+        Some(DomainValue::List(values)) => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                StorageSubvolumeConfig::from_value(value, file, &format!("{path}[{}]", index + 1))
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "{}: `{path}` must be a list of Btrfs subvolume tables",
             file.display()
         )),
         None => Ok(Vec::new()),

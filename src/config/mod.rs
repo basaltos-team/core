@@ -125,7 +125,10 @@ fn parse_config_source(path: &Path, input: &str) -> Result<BTreeMap<String, Doma
                 domains.insert(domain, value);
             }
         }
-        DomainValue::Boolean(_) | DomainValue::String(_) | DomainValue::List(_) => {
+        DomainValue::Boolean(_)
+        | DomainValue::Integer(_)
+        | DomainValue::String(_)
+        | DomainValue::List(_) => {
             return Err(format!(
                 "{}: config file must return a table",
                 path.display()
@@ -152,10 +155,11 @@ fn lua_value_to_domain_value(
                 )
             }),
         Value::Boolean(value) => Ok(DomainValue::Boolean(value)),
+        Value::Integer(value) => Ok(DomainValue::Integer(value)),
         Value::Table(table) => lua_table_to_domain_value(path, lua_path, table),
         Value::Nil => Err(format!("{}: `{lua_path}` is nil", path.display())),
         _ => Err(format!(
-            "{}: `{lua_path}` must be a boolean, string, list, or table",
+            "{}: `{lua_path}` must be a boolean, integer, string, list, or table",
             path.display()
         )),
     }
@@ -255,6 +259,59 @@ mod tests {
     fn rejects_non_returning_file() {
         let input = r#"local hostname = "basalt-vm""#;
         assert!(parse_config_source(Path::new("system.lua"), input).is_err());
+    }
+
+    #[test]
+    fn loads_storage_partition_numbers() {
+        let root = std::env::temp_dir().join(format!(
+            "basalt-storage-partition-number-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("system.lua"),
+            r#"return { system = { hostname = "basalt-test" } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages.lua"),
+            r#"return { packages = { pacman = {}, aur = {}, nix = {} } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("services.lua"),
+            r#"return { services = { enable = {}, disable = {} } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("storage.lua"),
+            r#"
+            return {
+              storage = {
+                layout = "manual",
+                target = "/mnt",
+                partitions = {
+                  {
+                    disk = "/dev/vda",
+                    number = 1,
+                    mountpoint = "/",
+                    filesystem = "xfs",
+                  },
+                },
+              },
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = validate_config_dir(&root).unwrap();
+
+        assert_eq!(
+            config.storage.unwrap().partitions[0].number.as_deref(),
+            Some("1")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

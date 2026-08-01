@@ -84,6 +84,107 @@ const DOMAINS: &[DomainSchema] = &[
         ],
     },
     DomainSchema {
+        name: "storage",
+        ownership: "owns guided installer storage intent",
+        fields: &[
+            FieldSchema {
+                path: "storage.layout",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.disk",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.target",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.efi_filesystem",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.root_filesystem",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions",
+                required: false,
+                field_type: "list<table>",
+            },
+            FieldSchema {
+                path: "storage.partitions[].disk",
+                required: true,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].number",
+                required: false,
+                field_type: "integer|string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].label",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].mountpoint",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].filesystem",
+                required: true,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].size",
+                required: false,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].flags",
+                required: false,
+                field_type: "list<string>",
+            },
+            FieldSchema {
+                path: "storage.partitions[].format",
+                required: false,
+                field_type: "boolean",
+            },
+            FieldSchema {
+                path: "storage.partitions[].mount_options",
+                required: false,
+                field_type: "list<string>",
+            },
+            FieldSchema {
+                path: "storage.partitions[].subvolumes",
+                required: false,
+                field_type: "list<table>",
+            },
+            FieldSchema {
+                path: "storage.partitions[].subvolumes[].name",
+                required: true,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].subvolumes[].mountpoint",
+                required: true,
+                field_type: "string",
+            },
+            FieldSchema {
+                path: "storage.partitions[].subvolumes[].mount_options",
+                required: false,
+                field_type: "list<string>",
+            },
+        ],
+    },
+    DomainSchema {
         name: "files",
         ownership: "owns managed file desired state intent",
         fields: &[
@@ -249,6 +350,8 @@ mod tests {
         let markdown = render_markdown();
         assert!(markdown.contains("# Basalt Config Schema v0"));
         assert!(markdown.contains("| `services.disable` | `list<string>` | no |"));
+        assert!(markdown.contains("| `storage.root_filesystem` | `string` | no |"));
+        assert!(markdown.contains("| `storage.partitions[].number` | `integer|string` | no |"));
         assert!(markdown.contains("| `files.managed[].content` | `string` | yes |"));
         assert!(markdown.contains("| `workspaces.<name>.path` | `string` | yes |"));
     }

@@ -7,6 +7,8 @@ use crate::state::store::{
     TargetRootStateReader,
 };
 
+const INSTALLED_CONFIG_DIR: &str = "/etc/basalt/install-config";
+
 pub fn run(args: Vec<String>) -> i32 {
     match parse_args(&args) {
         Ok(Command::Validate { config_dir }) => {
@@ -58,39 +60,49 @@ pub fn run(args: Vec<String>) -> i32 {
         Ok(Command::ApplyDryRun {
             config_dir,
             state_dir,
+            rebuild,
         }) => match crate::config::validate_config_dir(&config_dir) {
-            Ok(config) => match HostStateReader.read_current_state() {
-                Ok(current) => {
-                    let lock = match crate::apply::acquire_apply_lock(&state_dir, "dry-run") {
-                        Ok(lock) => lock,
-                        Err(err) => {
-                            eprintln!("failed to acquire apply lock: {err}");
-                            return 1;
+            Ok(config) => match validate_rebuild_safety_policy_if_needed(rebuild, &config) {
+                Ok(()) => match HostStateReader.read_current_state() {
+                    Ok(current) => {
+                        let lock = match crate::apply::acquire_apply_lock(&state_dir, "dry-run") {
+                            Ok(lock) => lock,
+                            Err(err) => {
+                                eprintln!("failed to acquire apply lock: {err}");
+                                return 1;
+                            }
+                        };
+                        let actions = crate::apply::dry_run_actions(&config, &current);
+                        print!("{}", crate::planning::report::render_dry_run(&actions));
+                        match crate::apply::write_dry_run_record(
+                            &state_dir, config_dir, &config, actions, &current,
+                        ) {
+                            Ok((run_path, latest_path)) => {
+                                println!();
+                                println!("Run record written:");
+                                println!("- {}", run_path.display());
+                                println!("- {}", latest_path.display());
+                                println!("State index written:");
+                                println!("- {}", state_dir.join("state.db").display());
+                                println!("Apply lock path: {}", lock.path().display());
+                            }
+                            Err(err) => {
+                                eprintln!("failed to write run record: {err}");
+                                return 1;
+                            }
                         }
-                    };
-                    let actions = crate::apply::dry_run_actions(&config, &current);
-                    print!("{}", crate::planning::report::render_dry_run(&actions));
-                    match crate::apply::write_dry_run_record(
-                        &state_dir, config_dir, &config, actions, &current,
-                    ) {
-                        Ok((run_path, latest_path)) => {
-                            println!();
-                            println!("Run record written:");
-                            println!("- {}", run_path.display());
-                            println!("- {}", latest_path.display());
-                            println!("State index written:");
-                            println!("- {}", state_dir.join("state.db").display());
-                            println!("Apply lock path: {}", lock.path().display());
-                        }
-                        Err(err) => {
-                            eprintln!("failed to write run record: {err}");
-                            return 1;
-                        }
+                        0
                     }
-                    0
-                }
-                Err(err) => {
-                    eprintln!("failed to read current state: {err}");
+                    Err(err) => {
+                        eprintln!("failed to read current state: {err}");
+                        1
+                    }
+                },
+                Err(errs) => {
+                    eprintln!("Basalt rebuild rejected:");
+                    for err in errs {
+                        eprintln!("- {err}");
+                    }
                     1
                 }
             },
@@ -135,52 +147,62 @@ pub fn run(args: Vec<String>) -> i32 {
             root_dir,
             package_executor,
             service_executor,
+            rebuild,
         }) => match crate::config::validate_config_dir(&config_dir) {
-            Ok(config) => match read_apply_current_state(&root_dir, &config) {
-                Ok(current) => match crate::apply::apply_supported_config(
-                    &state_dir,
-                    config_dir,
-                    &root_dir,
-                    &config,
-                    &current,
-                    package_executor,
-                    service_executor,
-                ) {
-                    Ok(summary) => {
-                        println!("Basalt apply");
-                        println!();
-                        println!("Applied {} action(s).", summary.actions.len());
-                        println!("Written files:");
-                        if summary.written_files.is_empty() {
-                            println!("- none");
-                        } else {
-                            for path in summary.written_files {
+            Ok(config) => match validate_rebuild_safety_policy_if_needed(rebuild, &config) {
+                Ok(()) => match read_apply_current_state(&root_dir, &config) {
+                    Ok(current) => match crate::apply::apply_supported_config(
+                        &state_dir,
+                        config_dir,
+                        &root_dir,
+                        &config,
+                        &current,
+                        package_executor,
+                        service_executor,
+                    ) {
+                        Ok(summary) => {
+                            println!("Basalt apply");
+                            println!();
+                            println!("Applied {} action(s).", summary.actions.len());
+                            println!("Written files:");
+                            if summary.written_files.is_empty() {
+                                println!("- none");
+                            } else {
+                                for path in summary.written_files {
+                                    println!("- {}", path.display());
+                                }
+                            }
+                            println!("Backup directory: {}", summary.backup_dir.display());
+                            if let Some(path) = summary.package_operations_path {
+                                println!("Package operations recorded:");
                                 println!("- {}", path.display());
                             }
+                            if let Some(path) = summary.service_operations_path {
+                                println!("Service operations recorded:");
+                                println!("- {}", path.display());
+                            }
+                            println!("Run record written:");
+                            println!("- {}", summary.run_path.display());
+                            println!("- {}", summary.latest_path.display());
+                            println!("State index written:");
+                            println!("- {}", state_dir.join("state.db").display());
+                            0
                         }
-                        println!("Backup directory: {}", summary.backup_dir.display());
-                        if let Some(path) = summary.package_operations_path {
-                            println!("Package operations recorded:");
-                            println!("- {}", path.display());
+                        Err(err) => {
+                            eprintln!("apply failed: {err}");
+                            1
                         }
-                        if let Some(path) = summary.service_operations_path {
-                            println!("Service operations recorded:");
-                            println!("- {}", path.display());
-                        }
-                        println!("Run record written:");
-                        println!("- {}", summary.run_path.display());
-                        println!("- {}", summary.latest_path.display());
-                        println!("State index written:");
-                        println!("- {}", state_dir.join("state.db").display());
-                        0
-                    }
+                    },
                     Err(err) => {
-                        eprintln!("apply failed: {err}");
+                        eprintln!("failed to read current state: {err}");
                         1
                     }
                 },
-                Err(err) => {
-                    eprintln!("failed to read current state: {err}");
+                Err(errs) => {
+                    eprintln!("Basalt rebuild rejected:");
+                    for err in errs {
+                        eprintln!("- {err}");
+                    }
                     1
                 }
             },
@@ -283,14 +305,14 @@ pub fn run(args: Vec<String>) -> i32 {
                 config.workspaces.as_ref(),
                 &output_dir,
             ) {
-                Ok(artifacts) => {
+                Ok(summary) => {
                     println!("Basalt workspace generate");
                     println!();
-                    if artifacts.is_empty() {
+                    if summary.artifacts.is_empty() {
                         println!("Generated workspaces: none");
                     } else {
                         println!("Generated workspaces:");
-                        for artifact in artifacts {
+                        for artifact in summary.artifacts {
                             println!(
                                 "- {}: {} -> {}",
                                 artifact.name,
@@ -299,6 +321,8 @@ pub fn run(args: Vec<String>) -> i32 {
                             );
                         }
                     }
+                    println!("Workspace state manifest:");
+                    println!("- {}", summary.state_manifest.display());
                     0
                 }
                 Err(err) => {
@@ -314,6 +338,25 @@ pub fn run(args: Vec<String>) -> i32 {
                 1
             }
         },
+        Ok(Command::WorkspaceCheck { manifest }) => {
+            match crate::workspaces::check_workspace_state_manifest(&manifest) {
+                Ok(check) => {
+                    print!(
+                        "{}",
+                        crate::workspaces::render_workspace_manifest_check(&check)
+                    );
+                    if check.is_ok() {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                Err(err) => {
+                    eprintln!("workspace manifest check failed: {err}");
+                    1
+                }
+            }
+        }
         Ok(Command::Restore {
             backup_dir,
             root_dir,
@@ -365,6 +408,7 @@ pub fn run(args: Vec<String>) -> i32 {
     }
 }
 
+#[derive(Debug)]
 enum Command {
     Validate {
         config_dir: PathBuf,
@@ -376,6 +420,7 @@ enum Command {
     ApplyDryRun {
         config_dir: PathBuf,
         state_dir: PathBuf,
+        rebuild: bool,
     },
     ApplyCheck {
         config_dir: PathBuf,
@@ -387,6 +432,7 @@ enum Command {
         root_dir: PathBuf,
         package_executor: crate::apply::PackageExecutorMode,
         service_executor: crate::apply::ServiceExecutorMode,
+        rebuild: bool,
     },
     Schema,
     History {
@@ -412,6 +458,9 @@ enum Command {
         config_dir: PathBuf,
         output_dir: PathBuf,
     },
+    WorkspaceCheck {
+        manifest: PathBuf,
+    },
     Restore {
         backup_dir: PathBuf,
         root_dir: PathBuf,
@@ -429,6 +478,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "validate" => parse_validate(args),
         "diff" => parse_diff(args),
         "apply" => parse_apply(args),
+        "rebuild" => parse_rebuild(args),
         "schema" => Ok(Command::Schema),
         "history" => parse_history(args),
         "inspect-run" => parse_inspect_run(args),
@@ -448,6 +498,7 @@ fn parse_workspace(args: &[String]) -> Result<Command, String> {
     };
     match subcommand {
         "generate" => parse_workspace_generate(args),
+        "check" => parse_workspace_check(args),
         other => Err(format!("unknown workspace subcommand `{other}`")),
     }
 }
@@ -483,6 +534,30 @@ fn parse_workspace_generate(args: &[String]) -> Result<Command, String> {
             .ok_or_else(|| "`workspace generate` requires `--config <path>`".to_string())?,
         output_dir: output_dir
             .ok_or_else(|| "`workspace generate` requires `--output <path>`".to_string())?,
+    })
+}
+
+fn parse_workspace_check(args: &[String]) -> Result<Command, String> {
+    let mut manifest = None;
+    let mut i = 3;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--manifest" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--manifest` requires a file path".to_string())?;
+                manifest = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::WorkspaceCheck {
+        manifest: manifest
+            .ok_or_else(|| "`workspace check` requires `--manifest <path>`".to_string())?,
     })
 }
 
@@ -618,6 +693,7 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
         Ok(Command::ApplyDryRun {
             config_dir,
             state_dir,
+            rebuild: false,
         })
     } else if check {
         Ok(Command::ApplyCheck {
@@ -631,6 +707,98 @@ fn parse_apply(args: &[String]) -> Result<Command, String> {
             root_dir: root_dir.unwrap_or_else(|| PathBuf::from("/")),
             package_executor,
             service_executor,
+            rebuild: false,
+        })
+    }
+}
+
+fn parse_rebuild(args: &[String]) -> Result<Command, String> {
+    parse_rebuild_with_default(args, Path::new(INSTALLED_CONFIG_DIR))
+}
+
+fn parse_rebuild_with_default(
+    args: &[String],
+    default_config_dir: &Path,
+) -> Result<Command, String> {
+    let mut dry_run = false;
+    let mut config_dir = None;
+    let mut state_dir = None;
+    let mut root_dir = None;
+    let mut package_executor = crate::apply::PackageExecutorMode::Host;
+    let mut service_executor = crate::apply::ServiceExecutorMode::Host;
+    let mut i = 2;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => dry_run = true,
+            "--config" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--config` requires a directory path".to_string())?;
+                config_dir = Some(PathBuf::from(value));
+            }
+            "--state-dir" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--state-dir` requires a directory path".to_string())?;
+                state_dir = Some(PathBuf::from(value));
+            }
+            "--root" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "`--root` requires a directory path".to_string())?;
+                root_dir = Some(PathBuf::from(value));
+            }
+            "--service-executor" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    "`--service-executor` requires `record` or `host`".to_string()
+                })?;
+                service_executor = crate::apply::ServiceExecutorMode::parse(value)?;
+            }
+            "--package-executor" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    "`--package-executor` requires `record` or `host`".to_string()
+                })?;
+                package_executor = crate::apply::PackageExecutorMode::parse(value)?;
+            }
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+
+    let config_dir = match config_dir {
+        Some(config_dir) => config_dir,
+        None => {
+            if !default_config_dir.is_dir() {
+                return Err(format!(
+                    "`rebuild` default config directory `{}` does not exist; pass `--config <path>` to rebuild from another config",
+                    default_config_dir.display()
+                ));
+            }
+            default_config_dir.to_path_buf()
+        }
+    };
+    let state_dir = state_dir.unwrap_or_else(|| PathBuf::from("./target/basalt-state"));
+
+    if dry_run {
+        Ok(Command::ApplyDryRun {
+            config_dir,
+            state_dir,
+            rebuild: true,
+        })
+    } else {
+        Ok(Command::Apply {
+            config_dir,
+            state_dir,
+            root_dir: root_dir.unwrap_or_else(|| PathBuf::from("/")),
+            package_executor,
+            service_executor,
+            rebuild: true,
         })
     }
 }
@@ -670,6 +838,66 @@ fn parse_history(args: &[String]) -> Result<Command, String> {
         state_dir: state_dir.unwrap_or_else(|| PathBuf::from("./target/basalt-state")),
         limit,
     })
+}
+
+fn validate_rebuild_safety_policy_if_needed(
+    rebuild: bool,
+    config: &crate::config::BasaltConfig,
+) -> Result<(), Vec<String>> {
+    if rebuild {
+        validate_rebuild_safety_policy(config)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_rebuild_safety_policy(config: &crate::config::BasaltConfig) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    if config.workspaces.is_some() {
+        errors.push(
+            "`rebuild` supports system, packages, services, files, and installed storage history; run `basalt workspace generate` for workspace config"
+                .to_string(),
+        );
+    }
+
+    if let Some(storage) = &config.storage {
+        if storage.layout == "installed" {
+            if !storage.partitions.is_empty() || storage.disk.is_some() {
+                errors.push(
+                    "`storage.layout = \"installed\"` must not include disks or partitions"
+                        .to_string(),
+                );
+            }
+        } else {
+            errors.push(format!(
+                "`storage.layout = \"{}\"` is install-only and cannot be used by `basalt rebuild`; use `storage.layout = \"installed\"` for installed-system history",
+                storage.layout
+            ));
+        }
+
+        if storage.disk.is_some() {
+            errors.push("`storage.disk` describes target-disk mutation and is blocked during `basalt rebuild`".to_string());
+        }
+
+        for (index, partition) in storage.partitions.iter().enumerate() {
+            let path = format!("storage.partitions[{}]", index + 1);
+            errors.push(format!(
+                "`{path}` describes partitioning/remounting intent and is blocked during `basalt rebuild`"
+            ));
+            if partition.format {
+                errors.push(format!(
+                    "`{path}.format = true` describes formatting intent and is blocked during `basalt rebuild`"
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn parse_inspect_run(args: &[String]) -> Result<Command, String> {
@@ -849,14 +1077,25 @@ fn print_help() {
     println!("  basalt apply --dry-run --config <path> [--state-dir <path>]");
     println!("  basalt apply --check --config <path> [--root <path>]");
     println!("  basalt apply --yes --config <path> [--state-dir <path>] [--root <path>] [--package-executor record|host] [--service-executor record|host]");
+    println!("  basalt rebuild [--dry-run] [--config <path>] [--state-dir <path>] [--root <path>]");
     println!("  basalt history [--state-dir <path>] [--limit <n>]");
     println!("  basalt inspect-run [--state-dir <path>] [--run latest|<id>]");
     println!("  basalt package-history --package <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt service-history --service <name> [--state-dir <path>] [--limit <n>]");
     println!("  basalt doctor");
     println!("  basalt workspace generate --config <path> --output <path>");
+    println!("  basalt workspace check --manifest <path>");
     println!("  basalt restore --backup <path> --yes [--root <path>]");
     println!("  basalt schema");
+    println!();
+    println!("Rebuild policy:");
+    println!(
+        "  basalt rebuild defaults to /etc/basalt/install-config and treats storage as historical only."
+    );
+    println!("  Rebuild accepts storage.layout = \"installed\" without disk or partition intent.");
+    println!(
+        "  Rebuild rejects install-time storage such as whole-disk/manual layouts, storage.disk, storage.partitions, and format = true before writing state."
+    );
 }
 
 fn read_apply_current_state(
@@ -966,6 +1205,218 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("basalt-cli-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_minimal_rebuild_config(root: &Path, storage: &str) {
+        std::fs::write(
+            root.join("system.lua"),
+            "return { system = { hostname = \"basalt-vm\" } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages.lua"),
+            "return { packages = { pacman = {}, aur = {}, nix = {} } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("services.lua"),
+            "return { services = { enable = {}, disable = {} } }\n",
+        )
+        .unwrap();
+        if !storage.is_empty() {
+            std::fs::write(root.join("storage.lua"), storage).unwrap();
+        }
+    }
+
+    #[test]
+    fn rebuild_defaults_to_installed_config_dir() {
+        let default_config = temp_test_dir("default-config");
+        let args = vec!["basalt".to_string(), "rebuild".to_string()];
+
+        let command = parse_rebuild_with_default(&args, &default_config).unwrap();
+
+        match command {
+            Command::Apply {
+                config_dir,
+                state_dir,
+                root_dir,
+                package_executor,
+                service_executor,
+                rebuild,
+            } => {
+                assert_eq!(config_dir, default_config);
+                assert_eq!(state_dir, PathBuf::from("./target/basalt-state"));
+                assert_eq!(root_dir, PathBuf::from("/"));
+                assert_eq!(package_executor, crate::apply::PackageExecutorMode::Host);
+                assert_eq!(service_executor, crate::apply::ServiceExecutorMode::Host);
+                assert!(rebuild);
+            }
+            _ => panic!("expected rebuild to parse as real apply"),
+        }
+    }
+
+    #[test]
+    fn rebuild_dry_run_defaults_to_installed_config_dir() {
+        let default_config = temp_test_dir("dry-run-default-config");
+        let args = vec![
+            "basalt".to_string(),
+            "rebuild".to_string(),
+            "--dry-run".to_string(),
+        ];
+
+        let command = parse_rebuild_with_default(&args, &default_config).unwrap();
+
+        match command {
+            Command::ApplyDryRun {
+                config_dir,
+                state_dir,
+                rebuild,
+            } => {
+                assert_eq!(config_dir, default_config);
+                assert_eq!(state_dir, PathBuf::from("./target/basalt-state"));
+                assert!(rebuild);
+            }
+            _ => panic!("expected rebuild --dry-run to parse as apply dry-run"),
+        }
+    }
+
+    #[test]
+    fn rebuild_explicit_config_overrides_missing_default() {
+        let explicit_config = PathBuf::from("/tmp/explicit-basalt-config");
+        let missing_default = std::env::temp_dir().join("basalt-cli-missing-default-config");
+        let args = vec![
+            "basalt".to_string(),
+            "rebuild".to_string(),
+            "--dry-run".to_string(),
+            "--config".to_string(),
+            explicit_config.display().to_string(),
+        ];
+
+        let command = parse_rebuild_with_default(&args, &missing_default).unwrap();
+
+        match command {
+            Command::ApplyDryRun {
+                config_dir,
+                rebuild,
+                ..
+            } => {
+                assert_eq!(config_dir, explicit_config);
+                assert!(rebuild);
+            }
+            _ => panic!("expected explicit rebuild --config to parse as apply dry-run"),
+        }
+    }
+
+    #[test]
+    fn rebuild_rejects_destructive_storage_config() {
+        let config_dir = temp_test_dir("destructive-storage");
+        write_minimal_rebuild_config(
+            &config_dir,
+            r#"return {
+  storage = {
+    layout = "manual",
+    disk = "/dev/vda",
+    target = "/mnt",
+    partitions = {
+      {
+        disk = "/dev/vda",
+        number = 1,
+        mountpoint = "/",
+        filesystem = "btrfs",
+        format = true,
+      },
+    },
+  },
+}
+"#,
+        );
+        let config = crate::config::validate_config_dir(&config_dir).unwrap();
+
+        let errors = validate_rebuild_safety_policy(&config).unwrap_err();
+
+        assert!(errors
+            .iter()
+            .any(|err| err.contains("install-only") && err.contains("manual")));
+        assert!(errors.iter().any(|err| err.contains("format = true")));
+    }
+
+    #[test]
+    fn rebuild_allows_non_storage_config() {
+        let config_dir = temp_test_dir("non-storage");
+        write_minimal_rebuild_config(&config_dir, "");
+        let config = crate::config::validate_config_dir(&config_dir).unwrap();
+
+        validate_rebuild_safety_policy(&config).unwrap();
+    }
+
+    #[test]
+    fn rebuild_allows_installed_storage_history() {
+        let config_dir = temp_test_dir("installed-storage-history");
+        write_minimal_rebuild_config(
+            &config_dir,
+            r#"return {
+  storage = {
+    layout = "installed",
+    root_filesystem = "btrfs",
+  },
+}
+"#,
+        );
+        let config = crate::config::validate_config_dir(&config_dir).unwrap();
+
+        validate_rebuild_safety_policy(&config).unwrap();
+    }
+
+    #[test]
+    fn real_rebuild_with_explicit_config_is_guarded() {
+        let explicit_config = PathBuf::from("/tmp/explicit-basalt-config");
+        let missing_default = std::env::temp_dir().join("basalt-cli-missing-default-config");
+        let args = vec![
+            "basalt".to_string(),
+            "rebuild".to_string(),
+            "--config".to_string(),
+            explicit_config.display().to_string(),
+        ];
+
+        let command = parse_rebuild_with_default(&args, &missing_default).unwrap();
+
+        match command {
+            Command::Apply {
+                config_dir,
+                rebuild,
+                ..
+            } => {
+                assert_eq!(config_dir, explicit_config);
+                assert!(rebuild);
+            }
+            _ => panic!("expected explicit rebuild --config to parse as guarded apply"),
+        }
+    }
+
+    #[test]
+    fn rebuild_missing_default_config_has_useful_error() {
+        let missing_default = std::env::temp_dir().join(format!(
+            "basalt-cli-missing-default-config-{}",
+            std::process::id()
+        ));
+        let args = vec!["basalt".to_string(), "rebuild".to_string()];
+
+        let err = parse_rebuild_with_default(&args, &missing_default).unwrap_err();
+
+        assert!(err.contains("default config directory"));
+        assert!(err.contains(&missing_default.display().to_string()));
+        assert!(err.contains("--config <path>"));
+    }
 
     #[test]
     fn renders_doctor_success_when_required_tools_exist() {
